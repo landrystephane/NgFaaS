@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	pb "ngfaas/pkg/api" // Import du code généré par Protobuf
@@ -50,7 +51,29 @@ func main() {
 	fmt.Printf("✅ Réponse du Controller : %s (Succès: %v)\n", res.Message, res.Success)
 
 	// -------------------------------------------------------------
-	// PARTIE 2 : Serveur HTTP (Recevoir les invocations des utilisateurs)
+	// PARTIE 2 : Écoute du Queue System NATS
+	// -------------------------------------------------------------
+
+	// Connexion à NATS
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		log.Fatalf("❌ Impossible de se connecter à NATS : %v", err)
+	}
+	defer nc.Close()
+
+	// On s'abonne au sujet sur lequel le contrôleur publie les mises à jour
+	_, err = nc.Subscribe("workers.updates", func(m *nats.Msg) {
+		// Dès qu'on reçoit un message, on l'affiche
+		// Dans une vraie app, on mettrait à jour une Map interne "workerID -> Adresse" pour le routage
+		fmt.Printf("📥 [DataPlane] Nouvelle info du Controller reçue via NATS : %s\n", string(m.Data))
+	})
+	if err != nil {
+		log.Fatalf("❌ Erreur lors de l'abonnement à NATS : %v", err)
+	}
+	fmt.Println("🎧 Data Plane abonné aux mises à jour des Workers via NATS.")
+
+	// -------------------------------------------------------------
+	// PARTIE 3 : Serveur HTTP (Recevoir les invocations des utilisateurs)
 	// -------------------------------------------------------------
 
 	// Simulation d'une route pour invoquer une fonction
