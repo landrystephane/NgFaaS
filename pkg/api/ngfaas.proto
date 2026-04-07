@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+// Le package sert à éviter les conflits de noms si on importe d'autres fichiers
+package ngfaas;
+
+// Cette option dit au compilateur Protobuf où générer le code Go et quel nom de package utiliser
+option go_package = "ngfaas/pkg/api";
+
+// ---------------------------------------------------------
+// 1. DÉFINITION DES SERVICES
+// ---------------------------------------------------------
+
+// ControllerService est le "contrat" que le Controller doit respecter.
+// Il expose les méthodes que les autres composants (DataPlane, Worker) peuvent appeler.
+service ControllerService {
+    // RegisterWorker permet à un Worker de s'annoncer auprès du Controller (Flèche 5 du schéma)
+    rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterResponse);
+
+    // RegisterDataPlane permet à un Data Plane de s'annoncer (Flèche 3 du schéma)
+    rpc RegisterDataPlane(RegisterDataPlaneRequest) returns (RegisterResponse);
+}
+
+// ---------------------------------------------------------
+// 2. DÉFINITION DES MESSAGES (Structures de données)
+// ---------------------------------------------------------
+
+// RegisterWorkerRequest contient les infos qu'un Worker envoie quand il s'enregistre
+message RegisterWorkerRequest {
+    // Chaque champ a un numéro unique (= 1, = 2) utilisé pour compresser les données
+    string worker_id = 1;
+    string ip_address = 2;
+    int32 port = 3;
+    // On pourrait ajouter d'autres infos plus tard : CPU disponible, RAM, etc.
+}
+
+// RegisterDataPlaneRequest contient les infos d'un DataPlane qui s'enregistre
+message RegisterDataPlaneRequest {
+    string dataplane_id = 1;
+    string ip_address = 2;
+}
+
+// RegisterResponse est la réponse standard renvoyée par le Controller
+message RegisterResponse {
+    bool success = 1;
+    string message = 2;
+}
