@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -35,12 +36,21 @@ func (s *server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerReque
 	fmt.Printf("💾 État du Worker %s sauvegardé en base de données.\n", req.WorkerId)
 
 	// 2. Publication via NATS (Queue System) pour prévenir les Data Planes
-	msg := fmt.Sprintf(`{"action":"add", "worker_id":"%s", "address":"%s"}`, req.WorkerId, val)
-	err = s.nc.Publish("workers.updates", []byte(msg))
-	if err != nil {
-		fmt.Printf("⚠️ Erreur lors de la publication sur NATS: %v\n", err)
+	updateMsg := map[string]interface{}{
+		"action":    "add",
+		"worker_id": req.WorkerId,
+		"address":   val,
+	}
+	msgBytes, jsonErr := json.Marshal(updateMsg)
+	if jsonErr != nil {
+		fmt.Printf("⚠️ Erreur lors de la création du message JSON pour NATS: %v\n", jsonErr)
 	} else {
-		fmt.Printf("📢 Information diffusée sur NATS (sujet: workers.updates)\n")
+		err = s.nc.Publish("workers.updates", msgBytes)
+		if err != nil {
+			fmt.Printf("⚠️ Erreur lors de la publication sur NATS: %v\n", err)
+		} else {
+			fmt.Printf("📢 Information diffusée sur NATS (sujet: workers.updates)\n")
+		}
 	}
 
 	return &pb.RegisterResponse{

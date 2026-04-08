@@ -82,5 +82,7 @@ func main() {
 	})
 
 	fmt.Println("🌐 Data Plane en écoute sur le port 8080 pour les utilisateurs")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Printf("Erreur du serveur HTTP: %v", err)
+	}
 }
