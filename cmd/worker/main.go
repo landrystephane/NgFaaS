@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
@@ -28,7 +29,7 @@ func main() {
 	// 3. Requête d'enregistrement du Worker
 	req := &pb.RegisterWorkerRequest{
 		WorkerId:  "worker-node-42",
-		IpAddress: "192.168.1.100",
+		IpAddress: "127.0.0.1",
 		Port:      9090, // Le port sur lequel ce Worker écouterait les DataPlanes
 	}
 
@@ -42,9 +43,25 @@ func main() {
 	}
 	fmt.Printf("✅ Réponse du Controller : %s (Succès: %v)\n", res.Message, res.Success)
 
-	// Simulation du fonctionnement continu
-	for {
-		fmt.Println("💤 Worker simulé en attente de requêtes (mock)...")
-		time.Sleep(10 * time.Second)
+	// -------------------------------------------------------------
+	// PARTIE 4 : Reverse Proxy HTTP (Attente des requêtes du Data Plane)
+	// -------------------------------------------------------------
+	// Mimir design: Le Data Plane invoque directement le Worker sans passer par le Controller
+
+	http.HandleFunc("/execute", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("🔥 [Worker] Requête d'exécution reçue depuis un Data Plane !")
+
+		// Simulation d'un temps de calcul (ex: exécution de la fonction dans une sandbox)
+		time.Sleep(50 * time.Millisecond)
+
+		// Renvoi du résultat au Data Plane
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status": "success", "result": "Fonction exécutée par %s"}`, req.WorkerId)
+	})
+
+	// Le Worker écoute sur le port 9090 comme déclaré lors de son enregistrement
+	fmt.Println("🌐 Worker en écoute sur le port 9090 pour les Data Planes (Data Path)...")
+	if err := http.ListenAndServe(":9090", nil); err != nil {
+		log.Printf("Erreur du serveur HTTP: %v", err)
 	}
 }

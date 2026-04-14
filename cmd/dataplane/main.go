@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -13,8 +16,25 @@ import (
 	pb "ngfaas/pkg/api" // Import du code généré par Protobuf
 )
 
+// RoutingTable garde en mémoire les adresses des Workers pour un routage direct
+type RoutingTable struct {
+	sync.RWMutex
+	workers map[string]string // map[worker_id]ip:port
+}
+
+// WorkerUpdate représente le message JSON envoyé par le Controller via NATS
+type WorkerUpdate struct {
+	Action   string `json:"action"`
+	WorkerID string `json:"worker_id"`
+	Address  string `json:"address"`
+}
+
 // main est le point d'entrée du Data Plane.
 func main() {
+	routingTable := &RoutingTable{
+		workers: make(map[string]string),
+	}
+
 	fmt.Println("🚀 Démarrage du Data Plane ngFaaS...")
 
 	// -------------------------------------------------------------
@@ -63,9 +83,19 @@ func main() {
 
 	// On s'abonne au sujet sur lequel le contrôleur publie les mises à jour
 	_, err = nc.Subscribe("workers.updates", func(m *nats.Msg) {
-		// Dès qu'on reçoit un message, on l'affiche
-		// Dans une vraie app, on mettrait à jour une Map interne "workerID -> Adresse" pour le routage
-		fmt.Printf("📥 [DataPlane] Nouvelle info du Controller reçue via NATS : %s\n", string(m.Data))
+		var update WorkerUpdate
+		if err := json.Unmarshal(m.Data, &update); err != nil {
+			log.Printf("⚠️ Erreur de parsing du message NATS : %v", err)
+			return
+		}
+
+		// On met à jour la table de routage locale (Decentralized Scheduling de Mimir)
+		routingTable.Lock()
+		if update.Action == "add" {
+			routingTable.workers[update.WorkerID] = update.Address
+			fmt.Printf("📥 [DataPlane] Table de routage mise à jour via NATS : %s -> %s\n", update.WorkerID, update.Address)
+		}
+		routingTable.Unlock()
 	})
 	if err != nil {
 		log.Fatalf("❌ Erreur lors de l'abonnement à NATS : %v", err)
@@ -76,9 +106,46 @@ func main() {
 	// PARTIE 3 : Serveur HTTP (Recevoir les invocations des utilisateurs)
 	// -------------------------------------------------------------
 
-	// Simulation d'une route pour invoquer une fonction
+	// Route d'invocation (Data Path) : le client appelle /invoke
 	http.HandleFunc("/invoke", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Requête reçue. Simulation de l'envoi vers un Worker...")
+		fmt.Println("🌐 [DataPlane] Requête HTTP reçue sur /invoke")
+
+		// 1. Choix d'un worker dans la table de routage (Decentralized Scheduling)
+		routingTable.RLock()
+		var targetAddress string
+		for _, addr := range routingTable.workers {
+			targetAddress = addr
+			break // Stratégie simple pour le prototype : on prend le premier disponible
+		}
+		routingTable.RUnlock()
+
+		if targetAddress == "" {
+			http.Error(w, "Aucun Worker disponible pour traiter la requête", http.StatusServiceUnavailable)
+			return
+		}
+
+		fmt.Printf("🎯 [DataPlane] Routage direct vers le Worker à l'adresse %s\n", targetAddress)
+
+		// 2. Invocation directe du Worker via HTTP (comme décrit dans le papier Mimir)
+		workerURL := fmt.Sprintf("http://%s/execute", targetAddress)
+		resp, err := http.Post(workerURL, "application/json", r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Erreur lors de la communication avec le Worker : %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		// 3. Renvoi de la réponse du Worker à l'utilisateur
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "Erreur lors de la lecture de la réponse", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(bodyBytes)
+		fmt.Println("✅ [DataPlane] Réponse du Worker transférée à l'utilisateur")
 	})
 
 	fmt.Println("🌐 Data Plane en écoute sur le port 8080 pour les utilisateurs")
