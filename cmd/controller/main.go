@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
@@ -20,136 +21,132 @@ type server struct {
 	nc  *nats.Conn    // Client NATS pour publier les messages
 }
 
-// RegisterWorker est appelé par un Worker quand il démarre
+// =========================================================================
+// 1. GESTION DES WORKERS (FaaS Cluster Mgmt)
+// =========================================================================
 func (s *server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerRequest) (*pb.RegisterResponse, error) {
-	fmt.Printf("👋 NOUVEAU WORKER ENREGISTRÉ : ID=%s, IP=%s, Port=%d\n", req.WorkerId, req.IpAddress, req.Port)
+	fmt.Printf("👋 NOUVEAU WORKER : ID=%s, IP=%s, Port=%d\n", req.WorkerId, req.IpAddress, req.Port)
 
-	// 1. Sauvegarde de l'état dans Redis (Persistance)
-	// On crée une clé du type "worker:node-42" et on sauvegarde son IP
+	// Sauvegarde de l'état dans Redis (Persistance)
 	key := fmt.Sprintf("worker:%s", req.WorkerId)
 	val := fmt.Sprintf("%s:%d", req.IpAddress, req.Port)
 
-	err := s.rdb.Set(ctx, key, val, 0).Err()
-	if err != nil {
-		return nil, fmt.Errorf("Erreur lors de la sauvegarde dans Redis: %v", err)
-	}
-	fmt.Printf("💾 État du Worker %s sauvegardé en base de données.\n", req.WorkerId)
-
-	// 2. Publication via NATS (Queue System) pour prévenir les Data Planes
-	updateMsg := map[string]interface{}{
-		"action":    "add",
-		"worker_id": req.WorkerId,
-		"address":   val,
-	}
-	msgBytes, jsonErr := json.Marshal(updateMsg)
-	if jsonErr != nil {
-		fmt.Printf("⚠️ Erreur lors de la création du message JSON pour NATS: %v\n", jsonErr)
-	} else {
-		err = s.nc.Publish("workers.updates", msgBytes)
-		if err != nil {
-			fmt.Printf("⚠️ Erreur lors de la publication sur NATS: %v\n", err)
-		} else {
-			fmt.Printf("📢 Information diffusée sur NATS (sujet: workers.updates)\n")
-		}
+	if err := s.rdb.Set(ctx, key, val, 0).Err(); err != nil {
+		return nil, fmt.Errorf("Erreur Redis: %v", err)
 	}
 
-	return &pb.RegisterResponse{
-		Success: true,
-		Message: "Worker bien enregistré et sauvegardé en DB par le Controller !",
-	}, nil
+	// Publication via NATS pour prévenir les Data Planes
+	updateMsg := map[string]interface{}{"action": "add", "type": "worker", "id": req.WorkerId, "address": val}
+	msgBytes, _ := json.Marshal(updateMsg)
+	s.nc.Publish("cluster.updates", msgBytes)
+
+	return &pb.RegisterResponse{Success: true, Message: "Worker enregistré en base."}, nil
 }
 
-// RegisterDataPlane est appelé par un DataPlane quand il démarre
+// =========================================================================
+// 2. GESTION DES DATAPLANES (FaaS Cluster Mgmt)
+// =========================================================================
 func (s *server) RegisterDataPlane(ctx context.Context, req *pb.RegisterDataPlaneRequest) (*pb.RegisterResponse, error) {
-	fmt.Printf("👋 NOUVEAU DATAPLANE ENREGISTRÉ : ID=%s, IP=%s\n", req.DataplaneId, req.IpAddress)
+	fmt.Printf("👋 NOUVEAU DATAPLANE : ID=%s, IP=%s\n", req.DataplaneId, req.IpAddress)
 
-	// Sauvegarde du Data Plane dans Redis
 	key := fmt.Sprintf("dataplane:%s", req.DataplaneId)
-	err := s.rdb.Set(ctx, key, req.IpAddress, 0).Err()
-	if err != nil {
-		return nil, fmt.Errorf("Erreur lors de la sauvegarde dans Redis: %v", err)
+	if err := s.rdb.Set(ctx, key, req.IpAddress, 0).Err(); err != nil {
+		return nil, fmt.Errorf("Erreur Redis: %v", err)
 	}
-	fmt.Printf("💾 État du DataPlane %s sauvegardé en base de données.\n", req.DataplaneId)
 
-	return &pb.RegisterResponse{
-		Success: true,
-		Message: "DataPlane bien enregistré et sauvegardé en DB par le Controller !",
-	}, nil
+	return &pb.RegisterResponse{Success: true, Message: "DataPlane enregistré en base."}, nil
 }
 
-// recoverState permet au contrôleur de récupérer son état depuis Redis après un redémarrage (Crash recovery)
-func recoverState(ctx context.Context, rdb *redis.Client) {
-	fmt.Println("🔄 Tentative de récupération de l'état depuis la Base de données (Redis)...")
+// =========================================================================
+// 3. GESTION DES FONCTIONS (FaaS Control)
+// =========================================================================
+func (s *server) RegisterFunction(ctx context.Context, req *pb.RegisterFunctionRequest) (*pb.RegisterResponse, error) {
+	fmt.Printf("📦 NOUVELLE FONCTION CRÉÉE : Nom=%s, Image=%s\n", req.FunctionName, req.ImageUrl)
 
-	// On cherche toutes les clés qui commencent par "worker:"
-	keys, err := rdb.Keys(ctx, "worker:*").Result()
-	if err != nil {
-		log.Printf("⚠️ Erreur de récupération: %v\n", err)
-		return
+	// Sauvegarde de la définition de la fonction dans Redis
+	key := fmt.Sprintf("function:%s", req.FunctionName)
+	funcData := map[string]interface{}{
+		"name":            req.FunctionName,
+		"image_url":       req.ImageUrl,
+		"memory_limit_mb": req.MemoryLimitMb,
+	}
+	funcBytes, _ := json.Marshal(funcData)
+
+	if err := s.rdb.Set(ctx, key, funcBytes, 0).Err(); err != nil {
+		return nil, fmt.Errorf("Erreur Redis: %v", err)
 	}
 
-	if len(keys) == 0 {
-		fmt.Println("ℹ️ Aucun état précédent trouvé. Le cluster démarre à zéro.")
-		return
-	}
+	// On prévient les Data Planes de l'existence de cette nouvelle fonction
+	updateMsg := map[string]interface{}{"action": "add", "type": "function", "name": req.FunctionName}
+	msgBytes, _ := json.Marshal(updateMsg)
+	s.nc.Publish("cluster.updates", msgBytes)
 
-	fmt.Printf("✅ %d Worker(s) retrouvé(s) en base de données :\n", len(keys))
+	return &pb.RegisterResponse{Success: true, Message: "Fonction ajoutée au registre !"}, nil
+}
+
+// =========================================================================
+// 4. HEARTBEATS (Surveillance du cluster)
+// =========================================================================
+func (s *server) SendHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	// Met à jour un timer d'expiration (TTL) dans Redis.
+	// Si on ne reçoit pas de ping d'ici 30 secondes, l'entrée sera effacée (composant considéré comme mort)
+	key := fmt.Sprintf("%s:%s", req.ComponentType, req.ComponentId)
+	s.rdb.Expire(ctx, key, 30*time.Second)
+
+	return &pb.HeartbeatResponse{Acknowledged: true}, nil
+}
+
+// =========================================================================
+// RECOVERY (Tolérance aux pannes)
+// =========================================================================
+// Si le Controller crash, le nouveau Controller relit Redis pour reconstruire son état
+func recoverState(ctx context.Context, rdb *redis.Client, nc *nats.Conn) {
+	fmt.Println("🔄 Récupération de l'état depuis Redis (Crash Recovery)...")
+
+	keys, _ := rdb.Keys(ctx, "worker:*").Result()
 	for _, key := range keys {
 		val, _ := rdb.Get(ctx, key).Result()
-		fmt.Printf("   -> %s (Adresse: %s)\n", key, val)
+		workerID := key[7:] // Enlève "worker:"
+
+		// On rediffuse l'état retrouvé aux Data Planes
+		updateMsg := map[string]interface{}{"action": "add", "type": "worker", "id": workerID, "address": val}
+		msgBytes, _ := json.Marshal(updateMsg)
+		nc.Publish("cluster.updates", msgBytes)
 	}
+	fmt.Printf("✅ %d Worker(s) restauré(s).\n", len(keys))
 }
 
-// main est le point d'entrée du Controller.
 func main() {
-	fmt.Println("👑 Démarrage du Controller ngFaaS...")
+	fmt.Println("👑 Démarrage du Controller ngFaaS (Control Plane)...")
 
-	// -------------------------------------------------------------
-	// 1. Connexion à la Base de Données (Redis)
-	// -------------------------------------------------------------
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379", // Adresse par défaut de Redis
-		Password: "",               // Pas de mot de passe en local
-		DB:       0,                // Utiliser la base de données par défaut
-	})
-
-	// Vérification de la connexion
+	// Connexion Redis
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("❌ Impossible de se connecter à Redis. Redis est-il démarré ? Erreur: %v", err)
+		log.Fatalf("❌ Redis injoignable: %v", err)
 	}
-	fmt.Println("✅ Connecté avec succès à la base de données Redis.")
 
-	// On lance la récupération d'état en cas de redémarrage après une panne
-	recoverState(ctx, rdb)
-
-	// -------------------------------------------------------------
-	// 2. Connexion à NATS (Queue System)
-	// -------------------------------------------------------------
+	// Connexion NATS
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("❌ Impossible de se connecter à NATS. Le serveur NATS est-il démarré ? Erreur: %v", err)
+		log.Fatalf("❌ NATS injoignable: %v", err)
 	}
 	defer nc.Close()
-	fmt.Println("✅ Connecté avec succès au serveur de messagerie NATS.")
 
-	// -------------------------------------------------------------
-	// 3. Démarrage du Serveur gRPC
-	// -------------------------------------------------------------
+	// Récupération d'état
+	recoverState(ctx, rdb, nc)
 
+	// Démarrage Serveur gRPC
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
-		log.Fatalf("❌ Erreur lors de l'ouverture du port : %v", err)
+		log.Fatalf("❌ Erreur réseau: %v", err)
 	}
 
 	s := grpc.NewServer()
-
-	// On attache notre logique au serveur gRPC, en lui passant nos clients Redis et NATS
 	pb.RegisterControllerServiceServer(s, &server{rdb: rdb, nc: nc})
 
-	fmt.Println("📡 Le Controller écoute les requêtes gRPC sur le port 50051...")
-
+	fmt.Println("📡 Le Controller écoute sur le port 50051...")
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("❌ Erreur du serveur gRPC : %v", err)
+		log.Fatalf("❌ Erreur gRPC: %v", err)
 	}
 }

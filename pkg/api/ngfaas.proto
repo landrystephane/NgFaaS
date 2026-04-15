@@ -1,46 +1,59 @@
 syntax = "proto3";
 
-// Le package sert à éviter les conflits de noms si on importe d'autres fichiers
-package ngfaas;
+package api;
 
-// Cette option dit au compilateur Protobuf où générer le code Go et quel nom de package utiliser
+// Spécifie où le code Go généré doit être placé
 option go_package = "ngfaas/pkg/api";
 
 // ---------------------------------------------------------
-// 1. DÉFINITION DES SERVICES
+// Service du Control Plane (Controller)
 // ---------------------------------------------------------
-
-// ControllerService est le "contrat" que le Controller doit respecter.
-// Il expose les méthodes que les autres composants (DataPlane, Worker) peuvent appeler.
 service ControllerService {
-    // RegisterWorker permet à un Worker de s'annoncer auprès du Controller (Flèche 5 du schéma)
-    rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterResponse);
+  // Enregistrement des composants d'infrastructure
+  rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterResponse);
+  rpc RegisterDataPlane (RegisterDataPlaneRequest) returns (RegisterResponse);
 
-    // RegisterDataPlane permet à un Data Plane de s'annoncer (Flèche 3 du schéma)
-    rpc RegisterDataPlane(RegisterDataPlaneRequest) returns (RegisterResponse);
+  // Enregistrement des fonctions par les clients
+  rpc RegisterFunction (RegisterFunctionRequest) returns (RegisterResponse);
+
+  // Heartbeats (peut aussi se faire via NATS, mais défini ici par l'API FaaS)
+  rpc SendHeartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 // ---------------------------------------------------------
-// 2. DÉFINITION DES MESSAGES (Structures de données)
+// Messages pour l'infrastructure
 // ---------------------------------------------------------
-
-// RegisterWorkerRequest contient les infos qu'un Worker envoie quand il s'enregistre
 message RegisterWorkerRequest {
-    // Chaque champ a un numéro unique (= 1, = 2) utilisé pour compresser les données
-    string worker_id = 1;
-    string ip_address = 2;
-    int32 port = 3;
-    // On pourrait ajouter d'autres infos plus tard : CPU disponible, RAM, etc.
+  string worker_id = 1;
+  string ip_address = 2;
+  int32 port = 3;
 }
 
-// RegisterDataPlaneRequest contient les infos d'un DataPlane qui s'enregistre
 message RegisterDataPlaneRequest {
-    string dataplane_id = 1;
-    string ip_address = 2;
+  string dataplane_id = 1;
+  string ip_address = 2;
 }
 
-// RegisterResponse est la réponse standard renvoyée par le Controller
 message RegisterResponse {
-    bool success = 1;
-    string message = 2;
+  bool success = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------
+// Messages pour les fonctions (FaaS Control)
+// ---------------------------------------------------------
+message RegisterFunctionRequest {
+  string function_name = 1;
+  string image_url = 2; // URL de l'image Docker ou Firecracker
+  int32 memory_limit_mb = 3;
+}
+
+message HeartbeatRequest {
+  string component_id = 1; // ID du Worker ou du DataPlane
+  string component_type = 2; // "worker" ou "dataplane"
+  string status = 3; // "active", "idle", "overloaded"
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
 }

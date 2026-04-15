@@ -5,6 +5,7 @@ go 1.24.0
 toolchain go1.24.3
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.34.0
 	github.com/redis/go-redis/v9 v9.18.0
 	google.golang.org/grpc v1.62.0

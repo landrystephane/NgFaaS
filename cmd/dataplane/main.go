@@ -10,26 +10,28 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	pb "ngfaas/pkg/api" // Import du code généré par Protobuf
+	pb "ngfaas/pkg/api"
 )
 
-// RoutingTable garde en mémoire les adresses des Workers pour un routage direct
+// RoutingTable garde en mémoire les adresses des Workers disponibles
 type RoutingTable struct {
 	sync.RWMutex
 	workers map[string]string // map[worker_id]ip:port
 }
 
-// WorkerUpdate représente le message JSON envoyé par le Controller via NATS
-type WorkerUpdate struct {
-	Action   string `json:"action"`
-	WorkerID string `json:"worker_id"`
-	Address  string `json:"address"`
+// ClusterUpdate représente un message NATS venant du Controller
+type ClusterUpdate struct {
+	Action  string `json:"action"` // "add" ou "remove"
+	Type    string `json:"type"`   // "worker" ou "function"
+	ID      string `json:"id"`
+	Address string `json:"address"`
 }
 
-// main est le point d'entrée du Data Plane.
 func main() {
 	routingTable := &RoutingTable{
 		workers: make(map[string]string),
@@ -37,118 +39,119 @@ func main() {
 
 	fmt.Println("🚀 Démarrage du Data Plane ngFaaS...")
 
-	// -------------------------------------------------------------
-	// PARTIE 1 : Communication gRPC avec le Controller
-	// -------------------------------------------------------------
+	// 1. Connexion Redis (pour stocker les résultats des tâches asynchrones)
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 
-	// 1. On se connecte au Controller (qui écoute sur le port 50051)
-	// On utilise 'insecure' car nous n'avons pas configuré de certificats de sécurité (TLS) pour ce prototype
+	// 2. Connexion gRPC au Controller
 	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("❌ Impossible de se connecter au Controller : %v", err)
 	}
-	// 'defer' signifie "exécute cette ligne tout à la fin de la fonction main, juste avant de quitter"
 	defer conn.Close()
-
-	// 2. On crée le "client" gRPC à partir de la connexion
 	client := pb.NewControllerServiceClient(conn)
 
-	// 3. On crée la requête d'enregistrement
-	req := &pb.RegisterDataPlaneRequest{
-		DataplaneId: "dp-europe-1",
-		IpAddress:   "127.0.0.1",
-	}
-
-	// 4. On appelle la méthode du Controller (avec un délai maximum de 5 secondes pour la réponse)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	// Enregistrement du DP
+	dpID := "dp-" + uuid.New().String()[:8]
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	fmt.Println("📞 Envoi de la demande d'enregistrement au Controller...")
-	res, err := client.RegisterDataPlane(ctx, req)
+	_, err = client.RegisterDataPlane(ctx, &pb.RegisterDataPlaneRequest{DataplaneId: dpID, IpAddress: "127.0.0.1"})
 	if err != nil {
-		log.Fatalf("❌ Erreur lors de l'enregistrement : %v", err)
+		log.Fatalf("❌ Erreur d'enregistrement DP: %v", err)
 	}
-	fmt.Printf("✅ Réponse du Controller : %s (Succès: %v)\n", res.Message, res.Success)
 
-	// -------------------------------------------------------------
-	// PARTIE 2 : Écoute du Queue System NATS
-	// -------------------------------------------------------------
-
-	// Connexion à NATS
+	// 3. Connexion NATS (pour recevoir les mises à jour du cluster en temps réel)
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
 		log.Fatalf("❌ Impossible de se connecter à NATS : %v", err)
 	}
 	defer nc.Close()
 
-	// On s'abonne au sujet sur lequel le contrôleur publie les mises à jour
-	_, err = nc.Subscribe("workers.updates", func(m *nats.Msg) {
-		var update WorkerUpdate
+	nc.Subscribe("cluster.updates", func(m *nats.Msg) {
+		var update ClusterUpdate
 		if err := json.Unmarshal(m.Data, &update); err != nil {
-			log.Printf("⚠️ Erreur de parsing du message NATS : %v", err)
 			return
 		}
 
-		// On met à jour la table de routage locale (Decentralized Scheduling de Mimir)
-		routingTable.Lock()
-		if update.Action == "add" {
-			routingTable.workers[update.WorkerID] = update.Address
-			fmt.Printf("📥 [DataPlane] Table de routage mise à jour via NATS : %s -> %s\n", update.WorkerID, update.Address)
+		if update.Type == "worker" && update.Action == "add" {
+			routingTable.Lock()
+			routingTable.workers[update.ID] = update.Address
+			fmt.Printf("📥 [DataPlane] Nouveau Worker détecté via NATS : %s -> %s\n", update.ID, update.Address)
+			routingTable.Unlock()
 		}
-		routingTable.Unlock()
 	})
-	if err != nil {
-		log.Fatalf("❌ Erreur lors de l'abonnement à NATS : %v", err)
-	}
-	fmt.Println("🎧 Data Plane abonné aux mises à jour des Workers via NATS.")
 
 	// -------------------------------------------------------------
-	// PARTIE 3 : Serveur HTTP (Recevoir les invocations des utilisateurs)
+	// API HTTP DU DATA PLANE (Le point d'entrée derrière NGINX)
 	// -------------------------------------------------------------
 
-	// Route d'invocation (Data Path) : le client appelle /invoke
-	http.HandleFunc("/invoke", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("🌐 [DataPlane] Requête HTTP reçue sur /invoke")
+	// A. INVOCATION SYNCHRONE : Attend que la fonction se termine
+	http.HandleFunc("/invoke/", func(w http.ResponseWriter, r *http.Request) {
+		funcName := r.URL.Path[len("/invoke/"):]
 
-		// 1. Choix d'un worker dans la table de routage (Decentralized Scheduling)
 		routingTable.RLock()
 		var targetAddress string
 		for _, addr := range routingTable.workers {
 			targetAddress = addr
-			break // Stratégie simple pour le prototype : on prend le premier disponible
+			break // Stratégie simple
 		}
 		routingTable.RUnlock()
 
 		if targetAddress == "" {
-			http.Error(w, "Aucun Worker disponible pour traiter la requête", http.StatusServiceUnavailable)
+			http.Error(w, "Aucun Worker disponible", http.StatusServiceUnavailable)
 			return
 		}
 
-		fmt.Printf("🎯 [DataPlane] Routage direct vers le Worker à l'adresse %s\n", targetAddress)
+		fmt.Printf("🎯 [Sync] Routage de '%s' vers le Worker %s\n", funcName, targetAddress)
 
-		// 2. Invocation directe du Worker via HTTP (comme décrit dans le papier Mimir)
-		workerURL := fmt.Sprintf("http://%s/execute", targetAddress)
+		// Appel direct au Worker (Data Path Mimir)
+		workerURL := fmt.Sprintf("http://%s/execute/%s", targetAddress, funcName)
 		resp, err := http.Post(workerURL, "application/json", r.Body)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Erreur lors de la communication avec le Worker : %v", err), http.StatusInternalServerError)
+			http.Error(w, "Erreur de communication avec le Worker", http.StatusInternalServerError)
 			return
 		}
 		defer resp.Body.Close()
 
-		// 3. Renvoi de la réponse du Worker à l'utilisateur
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			http.Error(w, "Erreur lors de la lecture de la réponse", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+
+	// B. INVOCATION ASYNCHRONE : Répond de suite, place la tâche dans Redis/NATS
+	http.HandleFunc("/invoke-async/", func(w http.ResponseWriter, r *http.Request) {
+		funcName := r.URL.Path[len("/invoke-async/"):]
+		jobID := uuid.New().String()
+
+		// On marque le job comme "En attente" dans Redis
+		rdb.Set(context.Background(), "job:"+jobID, "PENDING", 24*time.Hour)
+
+		// On publie la requête sur NATS pour qu'un Worker la récupère (File d'attente)
+		jobData := map[string]string{"job_id": jobID, "function": funcName}
+		jobBytes, _ := json.Marshal(jobData)
+		nc.Publish("async.jobs", jobBytes)
+
+		fmt.Printf("📦 [Async] Tâche asynchrone '%s' acceptée. ID: %s\n", funcName, jobID)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"message": "Requête acceptée. Vérifiez le statut plus tard.", "job_id": "%s"}`, jobID)
+	})
+
+	// C. VÉRIFICATION DE STATUT (Pour les appels asynchrones)
+	http.HandleFunc("/status/", func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/status/"):]
+
+		status, err := rdb.Get(context.Background(), "job:"+jobID).Result()
+		if err == redis.Nil {
+			http.Error(w, "Job introuvable", http.StatusNotFound)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		w.Write(bodyBytes)
-		fmt.Println("✅ [DataPlane] Réponse du Worker transférée à l'utilisateur")
+		fmt.Fprintf(w, `{"job_id": "%s", "status": "%s"}`, jobID, status)
 	})
 
-	fmt.Println("🌐 Data Plane en écoute sur le port 8080 pour les utilisateurs")
+	fmt.Println("🌐 Data Plane en écoute sur le port 8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Printf("Erreur du serveur HTTP: %v", err)
 	}

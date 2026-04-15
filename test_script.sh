@@ -3,6 +3,9 @@
 export GOOS=linux
 export GOARCH=amd64
 
+echo "Création du dossier de build..."
+mkdir -p build
+
 echo "Compiling controller..."
 go build -o build/controller cmd/controller/main.go
 echo "Compiling dataplane..."
