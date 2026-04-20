@@ -27,7 +27,7 @@ type ControllerServiceClient interface {
 	RegisterDataPlane(ctx context.Context, in *RegisterDataPlaneRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
 	// Enregistrement des fonctions par les clients
 	RegisterFunction(ctx context.Context, in *RegisterFunctionRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
-	// Heartbeats (peut aussi se faire via NATS, mais défini ici par l'API FaaS)
+	// Heartbeats (peut aussi se faire via NATS)
 	SendHeartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 }
 
@@ -84,7 +84,7 @@ type ControllerServiceServer interface {
 	RegisterDataPlane(context.Context, *RegisterDataPlaneRequest) (*RegisterResponse, error)
 	// Enregistrement des fonctions par les clients
 	RegisterFunction(context.Context, *RegisterFunctionRequest) (*RegisterResponse, error)
-	// Heartbeats (peut aussi se faire via NATS, mais défini ici par l'API FaaS)
+	// Heartbeats (peut aussi se faire via NATS)
 	SendHeartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	mustEmbedUnimplementedControllerServiceServer()
 }
@@ -212,6 +212,92 @@ var ControllerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SendHeartbeat",
 			Handler:    _ControllerService_SendHeartbeat_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "pkg/api/ngfaas.proto",
+}
+
+// WorkerServiceClient is the client API for WorkerService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type WorkerServiceClient interface {
+	InvokeFunction(ctx context.Context, in *InvokeRequest, opts ...grpc.CallOption) (*InvokeResponse, error)
+}
+
+type workerServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewWorkerServiceClient(cc grpc.ClientConnInterface) WorkerServiceClient {
+	return &workerServiceClient{cc}
+}
+
+func (c *workerServiceClient) InvokeFunction(ctx context.Context, in *InvokeRequest, opts ...grpc.CallOption) (*InvokeResponse, error) {
+	out := new(InvokeResponse)
+	err := c.cc.Invoke(ctx, "/api.WorkerService/InvokeFunction", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WorkerServiceServer is the server API for WorkerService service.
+// All implementations must embed UnimplementedWorkerServiceServer
+// for forward compatibility
+type WorkerServiceServer interface {
+	InvokeFunction(context.Context, *InvokeRequest) (*InvokeResponse, error)
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+// UnimplementedWorkerServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedWorkerServiceServer struct {
+}
+
+func (UnimplementedWorkerServiceServer) InvokeFunction(context.Context, *InvokeRequest) (*InvokeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method InvokeFunction not implemented")
+}
+func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
+
+// UnsafeWorkerServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to WorkerServiceServer will
+// result in compilation errors.
+type UnsafeWorkerServiceServer interface {
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+func RegisterWorkerServiceServer(s grpc.ServiceRegistrar, srv WorkerServiceServer) {
+	s.RegisterService(&WorkerService_ServiceDesc, srv)
+}
+
+func _WorkerService_InvokeFunction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InvokeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).InvokeFunction(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/api.WorkerService/InvokeFunction",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).InvokeFunction(ctx, req.(*InvokeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var WorkerService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "api.WorkerService",
+	HandlerType: (*WorkerServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "InvokeFunction",
+			Handler:    _WorkerService_InvokeFunction_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

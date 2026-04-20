@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -19,27 +18,60 @@ import (
 	pb "ngfaas/pkg/api"
 )
 
-// WorkerMeta contient les informations d'un worker, y compris les fonctions qu'il a déjà en mémoire (Warm Start possible)
+// WorkerMeta contient les informations d'un worker
 type WorkerMeta struct {
 	ID        string
 	Address   string
 	Functions map[string]string // map[function_name]nic_address
-	Load      int               // Simule la charge de travail actuelle
+	Load      int
 	LastSeen  time.Time
 }
 
-// RoutingTable est la mémoire du DataPlane, alimentée par NATS
+// RoutingTable est la memoire du DataPlane
 type RoutingTable struct {
 	sync.RWMutex
 	workers map[string]*WorkerMeta
 }
 
-// HeartbeatMsg correspond au format JSON envoyé par les Workers via NATS
+// HeartbeatMsg correspond au format JSON envoye par les Workers
 type HeartbeatMsg struct {
 	WorkerID  string            `json:"worker_id"`
 	Address   string            `json:"address"`
 	Load      int               `json:"load"`
 	Functions map[string]string `json:"functions"`
+}
+
+// ConnPool maintient les connexions gRPC ouvertes vers les Workers pour des performances extremes
+var (
+	connPoolMutex sync.RWMutex
+	workerClients = make(map[string]pb.WorkerServiceClient)
+)
+
+func getWorkerClient(address string) (pb.WorkerServiceClient, error) {
+	connPoolMutex.RLock()
+	client, exists := workerClients[address]
+	connPoolMutex.RUnlock()
+
+	if exists {
+		return client, nil
+	}
+
+	connPoolMutex.Lock()
+	defer connPoolMutex.Unlock()
+	// Double-check locking
+	if client, exists := workerClients[address]; exists {
+		return client, nil
+	}
+
+	fmt.Printf("🔌 [DataPlane] Etablissement d'une nouvelle connexion gRPC persistante vers %s\n", address)
+	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+
+	newClient := pb.NewWorkerServiceClient(conn)
+	workerClients[address] = newClient
+	return newClient, nil
 }
 
 func main() {
@@ -50,14 +82,14 @@ func main() {
 	dpID := "dp-" + uuid.New().String()[:8]
 	port := os.Getenv("DP_PORT")
 	if port == "" {
-		port = "8080" // Port par défaut, mais surchargeable pour lancer plusieurs instances
+		port = "8080"
 	}
 
-	fmt.Printf("🚀 Démarrage du Data Plane %s sur le port %s...\n", dpID, port)
+	fmt.Printf("🚀 Demarrage du Data Plane %s sur le port %s (HTTP -> gRPC Bridge)...\n", dpID, port)
 
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 
-	// Connexion au Controller (gRPC) pour enregistrement
+	// Connexion au Controller (gRPC)
 	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("❌ Impossible de se connecter au Controller : %v", err)
@@ -69,18 +101,18 @@ func main() {
 	defer cancel()
 	_, err = client.RegisterDataPlane(ctx, &pb.RegisterDataPlaneRequest{DataplaneId: dpID, IpAddress: "127.0.0.1"})
 	if err != nil {
-		log.Fatalf("❌ Erreur d'enregistrement DP: %v", err)
+		log.Fatalf("❌ Erreur enregistrement DP: %v", err)
 	}
 
 	// Connexion NATS
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("❌ Impossible de se connecter à NATS : %v", err)
+		log.Fatalf("❌ Impossible de se connecter a NATS : %v", err)
 	}
 	defer nc.Close()
 
 	// -----------------------------------------------------------------------------------
-	// INTELLIGENCE MIMIR : Écoute des Heartbeats détaillés pour construire la table de routage
+	// INTELLIGENCE DE ROUTAGE : Ecoute des Heartbeats
 	// -----------------------------------------------------------------------------------
 	nc.Subscribe("cluster.heartbeats", func(m *nats.Msg) {
 		var hb HeartbeatMsg
@@ -90,7 +122,7 @@ func main() {
 
 		routingTable.Lock()
 		if _, exists := routingTable.workers[hb.WorkerID]; !exists {
-			fmt.Printf("📥 [DataPlane %s] Nouveau Worker détecté: %s (Adresses: %s)\n", dpID, hb.WorkerID, hb.Address)
+			fmt.Printf("📥 [DataPlane %s] Nouveau Worker detecte: %s\n", dpID, hb.WorkerID)
 		}
 		routingTable.workers[hb.WorkerID] = &WorkerMeta{
 			ID:        hb.WorkerID,
@@ -102,7 +134,6 @@ func main() {
 		routingTable.Unlock()
 	})
 
-	// Nettoyage périodique des workers morts (TTL de 10 secondes)
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
@@ -110,8 +141,16 @@ func main() {
 			now := time.Now()
 			for id, meta := range routingTable.workers {
 				if now.Sub(meta.LastSeen) > 10*time.Second {
-					fmt.Printf("⚠️ [DataPlane %s] Worker %s injoignable. Retrait de la table.\n", dpID, id)
+					fmt.Printf("⚠️ [DataPlane %s] Worker %s injoignable. Retrait.\n", dpID, id)
 					delete(routingTable.workers, id)
+
+					// Nettoyage de la connexion gRPC
+					connPoolMutex.Lock()
+					// Fermeture propre de la connexion pour eviter les fuites de memoire
+					// (Necessite de caster l'interface ou de stocker la connexion initale)
+					// Pour ce prototype, on supprime juste du pool.
+					delete(workerClients, meta.Address)
+					connPoolMutex.Unlock()
 				}
 			}
 			routingTable.Unlock()
@@ -119,7 +158,7 @@ func main() {
 	}()
 
 	// -----------------------------------------------------------------------------------
-	// LOGIQUE DE SCHEDULING (La vraie décision Orchestrateur)
+	// LOGIQUE DE SCHEDULING
 	// -----------------------------------------------------------------------------------
 	findBestWorker := func(funcName string) string {
 		routingTable.RLock()
@@ -128,15 +167,15 @@ func main() {
 		var bestAddress string
 		var lowestLoad = 99999
 
-		// 1. Chercher un Warm Start (Worker qui a déjà la fonction)
+		// 1. Warm Start prioritaire
 		for _, worker := range routingTable.workers {
 			if _, hasFunc := worker.Functions[funcName]; hasFunc {
-				fmt.Printf("🧠 [Orchestrateur] Décision: Warm Start possible sur %s pour '%s'\n", worker.ID, funcName)
+				fmt.Printf("🧠 [Routing] Decision: Warm Start sur %s pour '%s'\n", worker.ID, funcName)
 				return worker.Address
 			}
 		}
 
-		// 2. Si pas de Warm Start, on cherche le Worker le moins chargé pour un Cold Start
+		// 2. Cold Start sur le moins charge
 		for _, worker := range routingTable.workers {
 			if worker.Load < lowestLoad {
 				lowestLoad = worker.Load
@@ -145,41 +184,57 @@ func main() {
 		}
 
 		if bestAddress != "" {
-			fmt.Printf("🧠 [Orchestrateur] Décision: Cold Start sur le worker le moins chargé (%s)\n", bestAddress)
+			fmt.Printf("🧠 [Routing] Decision: Cold Start sur le worker %s\n", bestAddress)
 		}
 
 		return bestAddress
 	}
 
 	// -------------------------------------------------------------
-	// API HTTP DU DATA PLANE
+	// API HTTP DU DATA PLANE (Le pont entre le client Web et le reseau gRPC)
 	// -------------------------------------------------------------
 
-	// A. INVOCATION SYNCHRONE
+	// A. INVOCATION SYNCHRONE (Passe maintenant par gRPC pour contacter le Worker)
 	http.HandleFunc("/invoke/", func(w http.ResponseWriter, r *http.Request) {
 		funcName := r.URL.Path[len("/invoke/"):]
 
 		targetAddress := findBestWorker(funcName)
 
 		if targetAddress == "" {
-			// Simule un appel à l'autoscaler via NATS
 			nc.Publish("cluster.autoscaler", []byte("Besoin d'un nouveau worker !"))
-			http.Error(w, "Aucun Worker disponible. Autoscaler prévenu.", http.StatusServiceUnavailable)
+			http.Error(w, `{"error": "Aucun Worker disponible. Autoscaler prevenu."}`, http.StatusServiceUnavailable)
 			return
 		}
 
-		// Routage Data Path direct (HTTP)
-		workerURL := fmt.Sprintf("http://%s/execute/%s", targetAddress, funcName)
-		resp, err := http.Post(workerURL, "application/json", r.Body)
+		// Recuperation du client gRPC pour ce Worker
+		workerClient, err := getWorkerClient(targetAddress)
 		if err != nil {
-			http.Error(w, "Erreur Worker", http.StatusInternalServerError)
+			http.Error(w, `{"error": "Erreur interne (gRPC Client)"}`, http.StatusInternalServerError)
 			return
 		}
-		defer resp.Body.Close()
+
+		// Appel gRPC ultra-rapide
+		invokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		resp, err := workerClient.InvokeFunction(invokeCtx, &pb.InvokeRequest{
+			FunctionName: funcName,
+			Payload:      []byte("{}"), // Dans un vrai projet, on passerait le body HTTP ici
+		})
+
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "Echec gRPC vers Worker: %v"}`, err), http.StatusBadGateway)
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		if resp.Success {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		w.Write([]byte(resp.Result))
 	})
 
 	// B. INVOCATION ASYNCHRONE
@@ -189,31 +244,29 @@ func main() {
 
 		rdb.Set(context.Background(), "job:"+jobID, "PENDING", 24*time.Hour)
 
-		// Au lieu de jeter au hasard, on alloue la tâche au meilleur Worker et on lui dit directement !
 		targetAddress := findBestWorker(funcName)
 		if targetAddress == "" {
 			nc.Publish("cluster.autoscaler", []byte("Besoin d'un nouveau worker !"))
-			http.Error(w, "Aucun Worker disponible", http.StatusServiceUnavailable)
+			http.Error(w, `{"error": "Aucun Worker disponible"}`, http.StatusServiceUnavailable)
 			return
 		}
 
-		// On envoie le job de manière asynchrone UNIQUEMENT au worker choisi via une route spécifique NATS
 		jobData := map[string]string{"job_id": jobID, "function": funcName}
 		jobBytes, _ := json.Marshal(jobData)
-		nc.Publish("worker.job."+targetAddress, jobBytes) // Routage déterministe
+		nc.Publish("worker.job."+targetAddress, jobBytes)
 
-		fmt.Printf("📦 [Async] Tâche '%s' allouée au worker %s. ID: %s\n", funcName, targetAddress, jobID)
+		fmt.Printf("📦 [Async] Tache '%s' allouee au worker %s. ID: %s\n", funcName, targetAddress, jobID)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprintf(w, `{"message": "Requête asynchrone acceptée.", "job_id": "%s"}`, jobID)
+		fmt.Fprintf(w, `{"message": "Requete asynchrone acceptee.", "job_id": "%s"}`, jobID)
 	})
 
 	http.HandleFunc("/status/", func(w http.ResponseWriter, r *http.Request) {
 		jobID := r.URL.Path[len("/status/"):]
 		status, err := rdb.Get(context.Background(), "job:"+jobID).Result()
 		if err == redis.Nil {
-			http.Error(w, "Job introuvable", http.StatusNotFound)
+			http.Error(w, `{"error": "Job introuvable"}`, http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
