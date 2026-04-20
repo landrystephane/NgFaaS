@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -17,57 +18,77 @@ import (
 	pb "ngfaas/pkg/api"
 )
 
-// WorkerState simule l'Hyperviseur et garde trace des MicroVMs/Sandboxes allumées
 type WorkerState struct {
 	sync.RWMutex
 	activeSandboxes map[string]string // map[function_name]virtual_nic_ip
+	currentLoad     int               // Nombre de requetes en cours
 }
 
-// Fonction utilitaire pour simuler l'allumage d'une MicroVM (Cold Start)
 func (ws *WorkerState) bootSandbox(funcName string) string {
 	ws.Lock()
 	defer ws.Unlock()
 
-	// Si elle a été démarrée par un autre thread entre temps (Warm Start)
 	if nic, exists := ws.activeSandboxes[funcName]; exists {
 		return nic
 	}
 
-	fmt.Printf("❄️  [Cold Start] Démarrage de l'Hyperviseur pour la fonction '%s'...\n", funcName)
-	time.Sleep(200 * time.Millisecond) // Simule le temps de démarrage (VM + OS)
+	fmt.Printf("❄️  [Cold Start] Demarrage Hyperviseur pour '%s'...\n", funcName)
+	time.Sleep(200 * time.Millisecond) // Simule creation de MicroVM
 
-	// Génère une fausse IP (NIC virtuel) pour cette Sandbox
 	virtualNIC := fmt.Sprintf("10.0.0.%d", len(ws.activeSandboxes)+2)
 	ws.activeSandboxes[funcName] = virtualNIC
-
-	fmt.Printf("✅ [Cold Start Terminé] Sandbox '%s' prête sur le NIC virtuel %s\n", funcName, virtualNIC)
 	return virtualNIC
+}
+
+// HeartbeatMsg format detaille pour l'intelligence de routage
+type HeartbeatMsg struct {
+	WorkerID  string            `json:"worker_id"`
+	Address   string            `json:"address"`
+	Load      int               `json:"load"`
+	Functions map[string]string `json:"functions"`
+}
+
+// Fonction pour obtenir un port libre dynamiquement
+func getFreePort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 func main() {
 	workerID := "worker-" + uuid.New().String()[:8]
-	workerPort := 9090 // Port d'écoute pour ce Worker (l'Agent FaaS)
+
+	port, err := getFreePort()
+	if err != nil {
+		log.Fatalf("Impossible de trouver un port libre : %v", err)
+	}
+	workerAddress := fmt.Sprintf("127.0.0.1:%d", port)
 
 	ws := &WorkerState{
 		activeSandboxes: make(map[string]string),
 	}
 
-	fmt.Printf("⚙️ Démarrage de l'Agent Worker %s...\n", workerID)
+	fmt.Printf("⚙️ Agent %s en ecoute sur %s\n", workerID, workerAddress)
 
-	// 1. Connexion Redis (pour mettre à jour le statut des jobs asynchrones)
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 
-	// 2. Connexion NATS (pour écouter la file d'attente Asynchrone)
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("❌ Impossible de se connecter à NATS : %v", err)
+		log.Fatalf("❌ NATS injoignable : %v", err)
 	}
 	defer nc.Close()
 
-	// 3. Inscription auprès du Controller (gRPC)
+	// Enregistrement aupres du Controller (gRPC)
 	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("❌ Impossible de se connecter au Controller : %v", err)
+		log.Fatalf("❌ Controller injoignable : %v", err)
 	}
 	defer conn.Close()
 	client := pb.NewControllerServiceClient(conn)
@@ -77,59 +98,87 @@ func main() {
 	_, err = client.RegisterWorker(ctx, &pb.RegisterWorkerRequest{
 		WorkerId:  workerID,
 		IpAddress: "127.0.0.1",
-		Port:      int32(workerPort),
+		Port:      int32(port),
 	})
 	if err != nil {
-		log.Fatalf("❌ Erreur d'enregistrement Worker: %v", err)
+		log.Fatalf("❌ Erreur enregistrement Worker: %v", err)
 	}
-	fmt.Println("✅ Enregistré auprès du Control Plane.")
 
-	// 4. Écoute de la file d'attente Asynchrone (NATS)
-	nc.QueueSubscribe("async.jobs", "worker_queue", func(m *nats.Msg) {
+	// -------------------------------------------------------------
+	// TELEMETRIE : Envoi periodique de l'etat detaille
+	// -------------------------------------------------------------
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			ws.RLock()
+
+			// Copie profonde de la map pour eviter une erreur de concurrence pendant la serialisation JSON
+			funcsCopy := make(map[string]string)
+			for k, v := range ws.activeSandboxes {
+				funcsCopy[k] = v
+			}
+
+			hb := HeartbeatMsg{
+				WorkerID:  workerID,
+				Address:   workerAddress,
+				Load:      ws.currentLoad,
+				Functions: funcsCopy,
+			}
+			ws.RUnlock()
+
+			hbBytes, _ := json.Marshal(hb)
+			nc.Publish("cluster.heartbeats", hbBytes)
+		}
+	}()
+
+	// -------------------------------------------------------------
+	// TACHES ASYNCHRONES
+	// -------------------------------------------------------------
+	nc.Subscribe("worker.job."+workerAddress, func(m *nats.Msg) {
 		var job map[string]string
 		json.Unmarshal(m.Data, &job)
 		funcName := job["function"]
 		jobID := job["job_id"]
 
-		fmt.Printf("📥 [Async Job] Prise en charge de la tâche %s\n", jobID)
+		ws.Lock()
+		ws.currentLoad++
+		ws.Unlock()
 
-		// Simule l'exécution
 		nic := ws.bootSandbox(funcName)
-		fmt.Printf("🔥 Exécution asynchrone sur NIC %s...\n", nic)
+		fmt.Printf("🔥 [Async] Execution sur NIC %s...\n", nic)
 		time.Sleep(500 * time.Millisecond) // Temps de calcul
 
-		// Met le résultat dans Redis
-		rdb.Set(context.Background(), "job:"+jobID, "SUCCESS (Résultat de la fonction)", 24*time.Hour)
-		fmt.Printf("✅ [Async Job] Tâche %s terminée.\n", jobID)
+		rdb.Set(context.Background(), "job:"+jobID, "SUCCESS (Worker: "+workerID+")", 24*time.Hour)
+
+		ws.Lock()
+		ws.currentLoad--
+		ws.Unlock()
 	})
 
 	// -------------------------------------------------------------
-	// 5. SERVEUR HTTP (L'Agent FaaS écoutant les requêtes Synchrones du DataPlane)
+	// TACHES SYNCHRONES (HTTP)
 	// -------------------------------------------------------------
 	http.HandleFunc("/execute/", func(w http.ResponseWriter, r *http.Request) {
 		funcName := r.URL.Path[len("/execute/"):]
 
-		ws.RLock()
-		nic, exists := ws.activeSandboxes[funcName]
-		ws.RUnlock()
+		ws.Lock()
+		ws.currentLoad++
+		ws.Unlock()
 
-		if !exists {
-			// Le Worker Agent demande à l'Hyperviseur de créer la sandbox
-			nic = ws.bootSandbox(funcName)
-		} else {
-			// Le Worker Agent transfère directement la requête au NIC existant
-			fmt.Printf("🔥 [Warm Start] Transfert direct de '%s' au NIC virtuel %s\n", funcName, nic)
-		}
+		nic := ws.bootSandbox(funcName)
+		fmt.Printf("🔥 [Sync] Transfert vers NIC %s\n", nic)
+		time.Sleep(50 * time.Millisecond) // Simulation de l'execution
 
-		// Simulation de l'exécution dans la VM
-		time.Sleep(50 * time.Millisecond)
+		ws.Lock()
+		ws.currentLoad--
+		ws.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status": "success", "executed_on_worker": "%s", "nic": "%s"}`, workerID, nic)
+		fmt.Fprintf(w, `{"status": "success", "worker": "%s", "nic": "%s"}`, workerID, nic)
 	})
 
-	fmt.Printf("🌐 Worker Agent %s en écoute sur le port %d\n", workerID, workerPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", workerPort), nil); err != nil {
-		log.Printf("Erreur du serveur HTTP: %v", err)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
+		log.Printf("Erreur HTTP: %v", err)
 	}
 }
