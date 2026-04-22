@@ -94,6 +94,8 @@ func main() {
 			} else {
 				// Fallback si on lance via `go run` depuis la racine
 				cmd = exec.Command("go", "run", "./cmd/worker/main.go")
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
 			}
 
 			err := cmd.Start()
