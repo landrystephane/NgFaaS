@@ -1,0 +1,2104 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..f91a652
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,11 @@
++# Binaries
++/build/
++controller
++dataplane
++worker
++
++# Go workspace
++*.work
++
++# OS specific
++.DS_Store
+diff --git a/2024_CVETKOVIC_Dirigent-Lightweight-Serverless-Orchestration.pdf b/Doc_Infos/2024_CVETKOVIC_Dirigent-Lightweight-Serverless-Orchestration.pdf
+similarity index 100%
+rename from 2024_CVETKOVIC_Dirigent-Lightweight-Serverless-Orchestration.pdf
+rename to Doc_Infos/2024_CVETKOVIC_Dirigent-Lightweight-Serverless-Orchestration.pdf
+diff --git a/API FaaS.pdf b/Doc_Infos/API FaaS.pdf
+similarity index 100%
+rename from API FaaS.pdf
+rename to Doc_Infos/API FaaS.pdf
+diff --git a/Mimir-final (1).pdf b/Doc_Infos/Mimir-final (1).pdf
+similarity index 100%
+rename from Mimir-final (1).pdf
+rename to Doc_Infos/Mimir-final (1).pdf
+diff --git a/basics-openwhisk.pdf b/Doc_Infos/basics-openwhisk.pdf
+similarity index 100%
+rename from basics-openwhisk.pdf
+rename to Doc_Infos/basics-openwhisk.pdf
+diff --git a/os-virtualization-security.pdf b/Doc_Infos/os-virtualization-security.pdf
+similarity index 100%
+rename from os-virtualization-security.pdf
+rename to Doc_Infos/os-virtualization-security.pdf
+diff --git a/os-virtualization.pdf b/Doc_Infos/os-virtualization.pdf
+similarity index 100%
+rename from os-virtualization.pdf
+rename to Doc_Infos/os-virtualization.pdf
+diff --git a/scaling-revisited.pdf b/Doc_Infos/scaling-revisited.pdf
+similarity index 100%
+rename from scaling-revisited.pdf
+rename to Doc_Infos/scaling-revisited.pdf
+diff --git a/serverless-computing.pdf b/Doc_Infos/serverless-computing.pdf
+similarity index 100%
+rename from serverless-computing.pdf
+rename to Doc_Infos/serverless-computing.pdf
+diff --git a/simple-container-engine.pdf b/Doc_Infos/simple-container-engine.pdf
+similarity index 100%
+rename from simple-container-engine.pdf
+rename to Doc_Infos/simple-container-engine.pdf
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..18af090
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,73 @@
++# Prototype ngFaaS
++
++Ce projet est un prototype d'architecture de plateforme **Function-as-a-Service (FaaS)** distribuée, développé dans le cadre du projet de recherche **ngFaaS**.
++
++L'architecture est inspirée des concepts mis en avant dans la recherche "Mimir", visant à réduire la latence des *Cold Starts* en décentralisant la prise de décision vers le plan de données (Data Plane).
++
++##  Architecture du Système
++
++Le système est composé de trois microservices principaux qui communiquent via **gRPC**, **Redis** et **NATS** :
++
++1. **Le Controller (Control Plane)** : Le cerveau central léger. Il gère l'enregistrement des composants du cluster, persiste l'état dans une base de données Redis (pour la tolérance aux pannes / Crash Recovery), et diffuse les changements d'état via NATS.
++2. **Le Data Plane** : Le routeur frontal intelligent (destiné à être derrière un proxy NGINX). Il maintient une vue locale des ressources disponibles en écoutant le Controller via NATS, permettant un routage quasi instantané (Data Path direct). Il supporte des invocations **Synchrones** et **Asynchrones**.
++3. **Le Worker (Simulateur d'exécution)** : Le serveur hôte. Il s'enregistre auprès du Controller à son démarrage. Il contient un "Worker Agent" qui simule l'interface avec un hyperviseur (ex: Firecracker). Il gère une table de routage virtuelle interne (NICs) pour simuler les **Cold Starts** (création de microVM) et les **Warm Starts** (réutilisation).
++
++---
++
++##  Prérequis et Installation
++
++Pour faire tourner ce projet, vous aurez besoin de :
++
++1. **Go (Golang)** (Version 1.22+).
++2. **Redis** (Port 6379 par défaut).
++3. **NATS Server** (Port 4222 par défaut).
++
++**Initialisation :**
++```bash
++go mod tidy
++```
++
++---
++
++##  Exécution du Projet
++
++Assurez-vous que **Redis** et **NATS Server** tournent.
++Lancez les composants dans cet ordre dans des terminaux séparés :
++
++```bash
++# Terminal 1 : Le Controller
++go run ./cmd/controller
++
++# Terminal 2 : Le Data Plane
++go run ./cmd/dataplane
++
++# Terminal 3 : Le Worker (Simulation avec Hyperviseur)
++go run ./cmd/worker
++```
++
++*(Note : Pour déployer sur le serveur Baremetal Linux, utilisez le script `./test_script.sh` pour compiler les binaires statiques `GOOS=linux`).*
++
++---
++
++##  Comment tester ?
++
++Le Data Plane écoute sur le port **8080**.
++
++**1. Invocation Synchrone (Temps Réel)**
++Le navigateur (ou curl) attend la réponse finale du Worker.
++```bash
++curl http://localhost:8080/invoke/ma-super-fonction
++```
++*Observez les logs du Worker : Le premier appel déclenchera un "Cold Start", les suivants feront un "Warm Start" instantané.*
++
++**2. Invocation Asynchrone (File d'attente)**
++La requête est mise en file, le Data Plane répond immédiatement avec un ID de job.
++```bash
++curl http://localhost:8080/invoke-async/tache-longue
++```
++
++**3. Vérifier le statut (Asynchrone)**
++Utilisez le `job_id` retourné à l'étape précédente :
++```bash
++curl http://localhost:8080/status/{job_id}
++```
+diff --git a/cmd/controller/main.go b/cmd/controller/main.go
+new file mode 100644
+index 0000000..5568fa2
+--- /dev/null
++++ b/cmd/controller/main.go
+@@ -0,0 +1,133 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"log"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sync"
++	"time"
++
++	"github.com/nats-io/nats.go"
++	"github.com/redis/go-redis/v9"
++	"google.golang.org/grpc"
++	pb "ngfaas/pkg/api"
++)
++
++type server struct {
++	pb.UnimplementedControllerServiceServer
++	rdb *redis.Client
++	nc  *nats.Conn
++}
++
++func (s *server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerRequest) (*pb.RegisterResponse, error) {
++	fmt.Printf("NOUVEAU WORKER ENREGISTRE : ID=%s, IP=%s, Port=%d\n", req.WorkerId, req.IpAddress, req.Port)
++
++	key := fmt.Sprintf("worker:%s", req.WorkerId)
++	val := fmt.Sprintf("%s:%d", req.IpAddress, req.Port)
++
++	s.rdb.Set(ctx, key, val, 0)
++	return &pb.RegisterResponse{Success: true}, nil
++}
++
++func (s *server) RegisterDataPlane(ctx context.Context, req *pb.RegisterDataPlaneRequest) (*pb.RegisterResponse, error) {
++	fmt.Printf("NOUVEAU DATAPLANE ENREGISTRE : ID=%s\n", req.DataplaneId)
++	s.rdb.Set(ctx, fmt.Sprintf("dataplane:%s", req.DataplaneId), req.IpAddress, 0)
++	return &pb.RegisterResponse{Success: true}, nil
++}
++
++func (s *server) RegisterFunction(ctx context.Context, req *pb.RegisterFunctionRequest) (*pb.RegisterResponse, error) {
++	return &pb.RegisterResponse{Success: true}, nil
++}
++
++func (s *server) SendHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
++	return &pb.HeartbeatResponse{Acknowledged: true}, nil
++}
++
++func main() {
++	fmt.Println(" Demarrage du Controller ngFaaS (Control Plane & Autoscaler)...")
++
++	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
++	ctx := context.Background()
++	if err := rdb.Ping(ctx).Err(); err != nil {
++		log.Fatalf(" Redis injoignable: %v", err)
++	}
++
++	nc, err := nats.Connect(nats.DefaultURL)
++	if err != nil {
++		log.Fatalf(" NATS injoignable: %v", err)
++	}
++	defer nc.Close()
++
++	// -------------------------------------------------------------
++	// AUTOSCALER SIMULE (Ecoute les alertes du DataPlane)
++	// -------------------------------------------------------------
++	var autoscalerMutex sync.Mutex
++	isSpawning := false
++
++	nc.Subscribe("cluster.autoscaler", func(m *nats.Msg) {
++		autoscalerMutex.Lock()
++		if isSpawning {
++			autoscalerMutex.Unlock()
++			return // Evite de lancer 50 workers d'un coup
++		}
++		isSpawning = true
++		autoscalerMutex.Unlock()
++
++		fmt.Println("📈 [Autoscaler] Alerte capacite ! Lancement d'un nouveau Worker en cours...")
++
++		go func() {
++			// Simulation de demarrage d'hyperviseur/processus
++			// On utilise le binaire precompile s'il existe (dans ./build/worker ou ./worker)
++			// sinon on fallback sur go run pour le dev local
++			var cmd *exec.Cmd
++
++			ex, _ := os.Executable()
++			exeDir := filepath.Dir(ex)
++			workerBin := filepath.Join(exeDir, "worker")
++
++			if _, err := os.Stat(workerBin); err == nil {
++				cmd = exec.Command(workerBin)
++			} else {
++				// Fallback si on lance via `go run` depuis la racine
++				cmd = exec.Command("go", "run", "./cmd/worker/main.go")
++				cmd.Stdout = os.Stdout
++				cmd.Stderr = os.Stderr
++			}
++
++			err := cmd.Start()
++			if err != nil {
++				fmt.Printf("Erreur Autoscaler: %v\n", err)
++			} else {
++				// Pour eviter les processus zombies, on lance une goroutine qui attend la fin du processus
++				go func() {
++					cmd.Wait()
++				}()
++			}
++
++			// Delai de grace avant d'autoriser un nouveau spawn
++			time.Sleep(3 * time.Second)
++
++			autoscalerMutex.Lock()
++			isSpawning = false
++			autoscalerMutex.Unlock()
++		}()
++	})
++
++	// Demarrage Serveur gRPC
++	lis, err := net.Listen("tcp", ":50051")
++	if err != nil {
++		log.Fatalf(" Erreur reseau: %v", err)
++	}
++
++	s := grpc.NewServer()
++	pb.RegisterControllerServiceServer(s, &server{rdb: rdb, nc: nc})
++
++	fmt.Println(" Le Controller ecoute sur le port 50051...")
++	if err := s.Serve(lis); err != nil {
++		log.Fatalf(" Erreur gRPC: %v", err)
++	}
++}
+diff --git a/cmd/dataplane/main.go b/cmd/dataplane/main.go
+new file mode 100644
+index 0000000..e710f9e
+--- /dev/null
++++ b/cmd/dataplane/main.go
+@@ -0,0 +1,285 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"log"
++	"net/http"
++	"os"
++	"sync"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/nats-io/nats.go"
++	"github.com/redis/go-redis/v9"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++	pb "ngfaas/pkg/api"
++)
++
++// WorkerMeta contient les informations d'un worker
++type WorkerMeta struct {
++	ID        string
++	Address   string
++	Functions map[string]string // map[function_name]nic_address
++	Load      int
++	LastSeen  time.Time
++}
++
++// RoutingTable est la memoire du DataPlane
++type RoutingTable struct {
++	sync.RWMutex
++	workers map[string]*WorkerMeta
++}
++
++// HeartbeatMsg correspond au format JSON envoye par les Workers
++type HeartbeatMsg struct {
++	WorkerID  string            `json:"worker_id"`
++	Address   string            `json:"address"`
++	Load      int               `json:"load"`
++	Functions map[string]string `json:"functions"`
++}
++
++// ClientConn wrappe le client et la connexion pour permettre une fermeture propre
++type ClientConn struct {
++	Client pb.WorkerServiceClient
++	Conn   *grpc.ClientConn
++}
++
++// ConnPool maintient les connexions gRPC ouvertes vers les Workers pour des performances extremes
++var (
++	connPoolMutex sync.RWMutex
++	workerClients = make(map[string]ClientConn)
++)
++
++func getWorkerClient(address string) (pb.WorkerServiceClient, error) {
++	connPoolMutex.RLock()
++	cc, exists := workerClients[address]
++	connPoolMutex.RUnlock()
++
++	if exists {
++		return cc.Client, nil
++	}
++
++	connPoolMutex.Lock()
++	defer connPoolMutex.Unlock()
++	// Double-check locking
++	if cc, exists := workerClients[address]; exists {
++		return cc.Client, nil
++	}
++
++	fmt.Printf("[DataPlane] Etablissement d'une nouvelle connexion gRPC persistante vers %s\n", address)
++	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		return nil, err
++	}
++
++	newClient := pb.NewWorkerServiceClient(conn)
++	workerClients[address] = ClientConn{Client: newClient, Conn: conn}
++	return newClient, nil
++}
++
++func main() {
++	routingTable := &RoutingTable{
++		workers: make(map[string]*WorkerMeta),
++	}
++
++	dpID := "dp-" + uuid.New().String()[:8]
++	port := os.Getenv("DP_PORT")
++	if port == "" {
++		port = "8080"
++	}
++
++	fmt.Printf("Demarrage du Data Plane %s sur le port %s (HTTP -> gRPC Bridge)...\n", dpID, port)
++
++	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
++
++	// Connexion au Controller (gRPC)
++	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		log.Fatalf(" Impossible de se connecter au Controller : %v", err)
++	}
++	defer conn.Close()
++	client := pb.NewControllerServiceClient(conn)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	_, err = client.RegisterDataPlane(ctx, &pb.RegisterDataPlaneRequest{DataplaneId: dpID, IpAddress: "127.0.0.1"})
++	if err != nil {
++		log.Fatalf(" Erreur enregistrement DP: %v", err)
++	}
++
++	// Connexion NATS
++	nc, err := nats.Connect(nats.DefaultURL)
++	if err != nil {
++		log.Fatalf(" Impossible de se connecter a NATS : %v", err)
++	}
++	defer nc.Close()
++
++	// -----------------------------------------------------------------------------------
++	// INTELLIGENCE DE ROUTAGE : Ecoute des Heartbeats
++	// -----------------------------------------------------------------------------------
++	nc.Subscribe("cluster.heartbeats", func(m *nats.Msg) {
++		var hb HeartbeatMsg
++		if err := json.Unmarshal(m.Data, &hb); err != nil {
++			return
++		}
++
++		routingTable.Lock()
++		if _, exists := routingTable.workers[hb.WorkerID]; !exists {
++			fmt.Printf("[DataPlane %s] Nouveau Worker detecte: %s\n", dpID, hb.WorkerID)
++		}
++		routingTable.workers[hb.WorkerID] = &WorkerMeta{
++			ID:        hb.WorkerID,
++			Address:   hb.Address,
++			Functions: hb.Functions,
++			Load:      hb.Load,
++			LastSeen:  time.Now(),
++		}
++		routingTable.Unlock()
++	})
++
++	go func() {
++		for {
++			time.Sleep(5 * time.Second)
++			routingTable.Lock()
++			now := time.Now()
++			for id, meta := range routingTable.workers {
++				if now.Sub(meta.LastSeen) > 10*time.Second {
++					fmt.Printf("[DataPlane %s] Worker %s injoignable. Retrait.\n", dpID, id)
++					delete(routingTable.workers, id)
++
++					// Nettoyage de la connexion gRPC
++					connPoolMutex.Lock()
++					if cc, exists := workerClients[meta.Address]; exists {
++						cc.Conn.Close()
++						delete(workerClients, meta.Address)
++					}
++					connPoolMutex.Unlock()
++				}
++			}
++			routingTable.Unlock()
++		}
++	}()
++
++	// -----------------------------------------------------------------------------------
++	// LOGIQUE DE SCHEDULING
++	// -----------------------------------------------------------------------------------
++	findBestWorker := func(funcName string) string {
++		routingTable.RLock()
++		defer routingTable.RUnlock()
++
++		var bestAddress string
++		var lowestLoad = 99999
++
++		// 1. Warm Start prioritaire
++		for _, worker := range routingTable.workers {
++			if _, hasFunc := worker.Functions[funcName]; hasFunc {
++				fmt.Printf("[Routing] Decision: Warm Start sur %s pour '%s'\n", worker.ID, funcName)
++				return worker.Address
++			}
++		}
++
++		// 2. Cold Start sur le moins charge
++		for _, worker := range routingTable.workers {
++			if worker.Load < lowestLoad {
++				lowestLoad = worker.Load
++				bestAddress = worker.Address
++			}
++		}
++
++		if bestAddress != "" {
++			fmt.Printf("[Routing] Decision: Cold Start sur le worker %s\n", bestAddress)
++		}
++
++		return bestAddress
++	}
++
++	// -------------------------------------------------------------
++	// API HTTP DU DATA PLANE (Le pont entre le client Web et le reseau gRPC)
++	// -------------------------------------------------------------
++
++	// A. INVOCATION SYNCHRONE (Passe maintenant par gRPC pour contacter le Worker)
++	http.HandleFunc("/invoke/", func(w http.ResponseWriter, r *http.Request) {
++		funcName := r.URL.Path[len("/invoke/"):]
++
++		targetAddress := findBestWorker(funcName)
++
++		if targetAddress == "" {
++			nc.Publish("cluster.autoscaler", []byte("Besoin d'un nouveau worker !"))
++			http.Error(w, `{"error": "Aucun Worker disponible. Autoscaler prevenu."}`, http.StatusServiceUnavailable)
++			return
++		}
++
++		// Recuperation du client gRPC pour ce Worker
++		workerClient, err := getWorkerClient(targetAddress)
++		if err != nil {
++			http.Error(w, `{"error": "Erreur interne (gRPC Client)"}`, http.StatusInternalServerError)
++			return
++		}
++
++		// Appel gRPC ultra-rapide
++		invokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++
++		resp, err := workerClient.InvokeFunction(invokeCtx, &pb.InvokeRequest{
++			FunctionName: funcName,
++			Payload:      []byte("{}"), // Payload HTTP a passer ici en production
++		})
++
++		if err != nil {
++			http.Error(w, fmt.Sprintf(`{"error": "Echec gRPC vers Worker: %v"}`, err), http.StatusBadGateway)
++			return
++		}
++
++		w.Header().Set("Content-Type", "application/json")
++		if resp.Success {
++			w.WriteHeader(http.StatusOK)
++		} else {
++			w.WriteHeader(http.StatusInternalServerError)
++		}
++
++		w.Write([]byte(resp.Result))
++	})
++
++	// B. INVOCATION ASYNCHRONE
++	http.HandleFunc("/invoke-async/", func(w http.ResponseWriter, r *http.Request) {
++		funcName := r.URL.Path[len("/invoke-async/"):]
++		jobID := uuid.New().String()
++
++		rdb.Set(context.Background(), "job:"+jobID, "PENDING", 24*time.Hour)
++
++		targetAddress := findBestWorker(funcName)
++		if targetAddress == "" {
++			nc.Publish("cluster.autoscaler", []byte("Besoin d'un nouveau worker !"))
++			http.Error(w, `{"error": "Aucun Worker disponible"}`, http.StatusServiceUnavailable)
++			return
++		}
++
++		jobData := map[string]string{"job_id": jobID, "function": funcName}
++		jobBytes, _ := json.Marshal(jobData)
++		nc.Publish("worker.job."+targetAddress, jobBytes)
++
++		fmt.Printf("[Async] Tache '%s' allouee au worker %s. ID: %s\n", funcName, targetAddress, jobID)
++
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusAccepted)
++		fmt.Fprintf(w, `{"message": "Requete asynchrone acceptee.", "job_id": "%s"}`, jobID)
++	})
++
++	http.HandleFunc("/status/", func(w http.ResponseWriter, r *http.Request) {
++		jobID := r.URL.Path[len("/status/"):]
++		status, err := rdb.Get(context.Background(), "job:"+jobID).Result()
++		if err == redis.Nil {
++			http.Error(w, `{"error": "Job introuvable"}`, http.StatusNotFound)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		fmt.Fprintf(w, `{"job_id": "%s", "status": "%s"}`, jobID, status)
++	})
++
++	if err := http.ListenAndServe(":"+port, nil); err != nil {
++		log.Fatalf("Erreur du serveur HTTP: %v", err)
++	}
++}
+diff --git a/cmd/worker/main.go b/cmd/worker/main.go
+new file mode 100644
+index 0000000..2af57f3
+--- /dev/null
++++ b/cmd/worker/main.go
+@@ -0,0 +1,203 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"log"
++	"net"
++	"sync"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/nats-io/nats.go"
++	"github.com/redis/go-redis/v9"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++	pb "ngfaas/pkg/api"
++)
++
++type WorkerState struct {
++	sync.RWMutex
++	activeSandboxes map[string]string // map[function_name]virtual_nic_ip
++	currentLoad     int               // Nombre de requetes en cours
++}
++
++func (ws *WorkerState) bootSandbox(funcName string) string {
++	ws.Lock()
++	defer ws.Unlock()
++
++	if nic, exists := ws.activeSandboxes[funcName]; exists {
++		return nic
++	}
++
++	fmt.Printf("[Cold Start] Demarrage Hyperviseur pour '%s'...\n", funcName)
++	time.Sleep(200 * time.Millisecond) // Simule creation de MicroVM
++
++	virtualNIC := fmt.Sprintf("10.0.0.%d", len(ws.activeSandboxes)+2)
++	ws.activeSandboxes[funcName] = virtualNIC
++	return virtualNIC
++}
++
++// HeartbeatMsg format detaille pour l'intelligence de routage
++type HeartbeatMsg struct {
++	WorkerID  string            `json:"worker_id"`
++	Address   string            `json:"address"`
++	Load      int               `json:"load"`
++	Functions map[string]string `json:"functions"`
++}
++
++// workerServer implemente le WorkerService gRPC specifie dans le proto
++type workerServer struct {
++	pb.UnimplementedWorkerServiceServer
++	workerID string
++	state    *WorkerState
++}
++
++// InvokeFunction est la methode appelee par le Data Plane (Data Path gRPC ultra-rapide)
++func (s *workerServer) InvokeFunction(ctx context.Context, req *pb.InvokeRequest) (*pb.InvokeResponse, error) {
++	s.state.Lock()
++	s.state.currentLoad++
++	s.state.Unlock()
++
++	nic := s.state.bootSandbox(req.FunctionName)
++	fmt.Printf("[Sync-gRPC] Transfert de la requete vers NIC %s\n", nic)
++	time.Sleep(50 * time.Millisecond) // Simulation de l'execution dans l'hyperviseur
++
++	s.state.Lock()
++	s.state.currentLoad--
++	s.state.Unlock()
++
++	resultStr := fmt.Sprintf(`{"status": "success", "worker": "%s", "nic": "%s"}`, s.workerID, nic)
++	return &pb.InvokeResponse{
++		Success:      true,
++		Result:       resultStr,
++		ExecutionNic: nic,
++	}, nil
++}
++
++// Fonction pour obtenir un port libre dynamiquement
++func getFreePort() (int, error) {
++	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
++	if err != nil {
++		return 0, err
++	}
++	l, err := net.ListenTCP("tcp", addr)
++	if err != nil {
++		return 0, err
++	}
++	defer l.Close()
++	return l.Addr().(*net.TCPAddr).Port, nil
++}
++
++func main() {
++	workerID := "worker-" + uuid.New().String()[:8]
++
++	port, err := getFreePort()
++	if err != nil {
++		log.Fatalf("Impossible de trouver un port libre : %v", err)
++	}
++	workerAddress := fmt.Sprintf("127.0.0.1:%d", port)
++
++	ws := &WorkerState{
++		activeSandboxes: make(map[string]string),
++	}
++
++	fmt.Printf("Agent %s en ecoute sur %s (gRPC Data Path)\n", workerID, workerAddress)
++
++	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
++
++	nc, err := nats.Connect(nats.DefaultURL)
++	if err != nil {
++		log.Fatalf(" NATS injoignable : %v", err)
++	}
++	defer nc.Close()
++
++	// Enregistrement aupres du Controller (gRPC)
++	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
++	if err != nil {
++		log.Fatalf(" Controller injoignable : %v", err)
++	}
++	defer conn.Close()
++	client := pb.NewControllerServiceClient(conn)
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	_, err = client.RegisterWorker(ctx, &pb.RegisterWorkerRequest{
++		WorkerId:  workerID,
++		IpAddress: "127.0.0.1",
++		Port:      int32(port),
++	})
++	if err != nil {
++		log.Fatalf(" Erreur enregistrement Worker: %v", err)
++	}
++
++	// -------------------------------------------------------------
++	// TELEMETRIE : Envoi periodique de l'etat detaille
++	// -------------------------------------------------------------
++	go func() {
++		ticker := time.NewTicker(2 * time.Second)
++		defer ticker.Stop()
++		for range ticker.C {
++			ws.RLock()
++
++			funcsCopy := make(map[string]string)
++			for k, v := range ws.activeSandboxes {
++				funcsCopy[k] = v
++			}
++
++			hb := HeartbeatMsg{
++				WorkerID:  workerID,
++				Address:   workerAddress,
++				Load:      ws.currentLoad,
++				Functions: funcsCopy,
++			}
++			ws.RUnlock()
++
++			hbBytes, _ := json.Marshal(hb)
++			nc.Publish("cluster.heartbeats", hbBytes)
++		}
++	}()
++
++	// -------------------------------------------------------------
++	// TACHES ASYNCHRONES (NATS Queue)
++	// -------------------------------------------------------------
++	nc.Subscribe("worker.job."+workerAddress, func(m *nats.Msg) {
++		var job map[string]string
++		json.Unmarshal(m.Data, &job)
++		funcName := job["function"]
++		jobID := job["job_id"]
++
++		ws.Lock()
++		ws.currentLoad++
++		ws.Unlock()
++
++		nic := ws.bootSandbox(funcName)
++		fmt.Printf("[Async] Execution sur NIC %s...\n", nic)
++		time.Sleep(500 * time.Millisecond) // Temps de calcul
++
++		rdb.Set(context.Background(), "job:"+jobID, "SUCCESS (Worker: "+workerID+")", 24*time.Hour)
++
++		ws.Lock()
++		ws.currentLoad--
++		ws.Unlock()
++	})
++
++	// -------------------------------------------------------------
++	// DEMARRAGE DU SERVEUR gRPC DU WORKER (Le vrai Data Path Mimir)
++	// -------------------------------------------------------------
++	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
++	if err != nil {
++		log.Fatalf(" Erreur reseau Worker: %v", err)
++	}
++
++	grpcServer := grpc.NewServer()
++	pb.RegisterWorkerServiceServer(grpcServer, &workerServer{
++		workerID: workerID,
++		state:    ws,
++	})
++
++	if err := grpcServer.Serve(lis); err != nil {
++		log.Fatalf(" Erreur serveur gRPC Worker: %v", err)
++	}
++}
+diff --git a/dirigent b/dirigent
+new file mode 160000
+index 0000000..13b84bb
+--- /dev/null
++++ b/dirigent
+@@ -0,0 +1 @@
++Subproject commit 13b84bbabcc88a06ca13a57b057de70d9f03ca6a
+diff --git a/go.mod b/go.mod
+new file mode 100644
+index 0000000..d2947d7
+--- /dev/null
++++ b/go.mod
+@@ -0,0 +1,28 @@
++module ngfaas
++
++go 1.24.0
++
++toolchain go1.24.3
++
++require (
++	github.com/google/uuid v1.6.0
++	github.com/nats-io/nats.go v1.34.0
++	github.com/redis/go-redis/v9 v9.18.0
++	google.golang.org/grpc v1.62.0
++	google.golang.org/protobuf v1.33.0
++)
++
++require (
++	github.com/cespare/xxhash/v2 v2.3.0 // indirect
++	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
++	github.com/golang/protobuf v1.5.3 // indirect
++	github.com/klauspost/compress v1.18.5 // indirect
++	github.com/nats-io/nkeys v0.4.8 // indirect
++	github.com/nats-io/nuid v1.0.1 // indirect
++	go.uber.org/atomic v1.11.0 // indirect
++	golang.org/x/crypto v0.21.0 // indirect
++	golang.org/x/net v0.22.0 // indirect
++	golang.org/x/sys v0.18.0 // indirect
++	golang.org/x/text v0.14.0 // indirect
++	google.golang.org/genproto/googleapis/rpc v0.0.0-20240123012728-ef4313101c80 // indirect
++)
+diff --git a/go.sum b/go.sum
+new file mode 100644
+index 0000000..9064a32
+--- /dev/null
++++ b/go.sum
+@@ -0,0 +1,55 @@
++github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
++github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
++github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=
++github.com/bsm/gomega v1.27.10/go.mod h1:JyEr/xRbxbtgWNi8tIEVPUYZ5Dzef52k01W3YH0H+O0=
++github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
++github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
++github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
++github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0jiPLLBs70cWOduZpkS1E78=
++github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
++github.com/golang/protobuf v1.5.0/go.mod h1:FsONVRAS9T7sI+LIUmWTfcYkHO4aIWwzhcaSAoJOfIk=
++github.com/golang/protobuf v1.5.3 h1:KhyjKVUg7Usr/dYsdSqoFveMYd5ko72D+zANwlG1mmg=
++github.com/golang/protobuf v1.5.3/go.mod h1:XVQd3VNwM+JqD3oG2Ue2ip4fOMUkwXdXDdiuN0vRsmY=
++github.com/google/go-cmp v0.5.5/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
++github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
++github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
++github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
++github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
++github.com/klauspost/compress v1.18.5 h1:/h1gH5Ce+VWNLSWqPzOVn6XBO+vJbCNGvjoaGBFW2IE=
++github.com/klauspost/compress v1.18.5/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
++github.com/klauspost/cpuid/v2 v2.0.9 h1:lgaqFMSdTdQYdZ04uHyN2d/eKdOMyi2YLSvlQIBFYa4=
++github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
++github.com/nats-io/nats.go v1.34.0 h1:fnxnPCNiwIG5w08rlMcEKTUw4AV/nKyGCOJE8TdhSPk=
++github.com/nats-io/nats.go v1.34.0/go.mod h1:Ubdu4Nh9exXdSz0RVWRFBbRfrbSxOYd26oF0wkWclB8=
++github.com/nats-io/nkeys v0.4.8 h1:+wee30071y3vCZAYRsnrmIPaOe47A/SkK/UBDPdIV70=
++github.com/nats-io/nkeys v0.4.8/go.mod h1:kqXRgRDPlGy7nGaEDMuYzmiJCIAAWDK0IMBtDmGD0nc=
++github.com/nats-io/nuid v1.0.1 h1:5iA8DT8V7q8WK2EScv2padNa/rTESc1KdnPw4TC2paw=
++github.com/nats-io/nuid v1.0.1/go.mod h1:19wcPz3Ph3q0Jbyiqsd0kePYG7A95tJPxeL+1OSON2c=
++github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
++github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/redis/go-redis/v9 v9.18.0 h1:pMkxYPkEbMPwRdenAzUNyFNrDgHx9U+DrBabWNfSRQs=
++github.com/redis/go-redis/v9 v9.18.0/go.mod h1:k3ufPphLU5YXwNTUcCRXGxUoF1fqxnhFQmscfkCoDA0=
++github.com/stretchr/testify v1.3.0 h1:TivCn/peBQ7UY8ooIcPgZFpTNSz0Q2U6UrFlUfqbe0Q=
++github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
++github.com/zeebo/xxh3 v1.0.2 h1:xZmwmqxHZA8AI603jOQ0tMqmBr9lPeFwGg6d+xy9DC0=
++github.com/zeebo/xxh3 v1.0.2/go.mod h1:5NWz9Sef7zIDm2JHfFlcQvNekmcEl9ekUZQQKCYaDcA=
++go.uber.org/atomic v1.11.0 h1:ZvwS0R+56ePWxUNi+Atn9dWONBPp/AUETXlHW0DxSjE=
++go.uber.org/atomic v1.11.0/go.mod h1:LUxbIzbOniOlMKjJjyPfpl4v+PKK2cNJn91OQbhoJI0=
++golang.org/x/crypto v0.21.0 h1:X31++rzVUdKhX5sWmSOFZxx8UW/ldWx55cbf08iNAMA=
++golang.org/x/crypto v0.21.0/go.mod h1:0BP7YvVV9gBbVKyeTG0Gyn+gZm94bibOW5BjDEYAOMs=
++golang.org/x/net v0.22.0 h1:9sGLhx7iRIHEiX0oAJ3MRZMUCElJgy7Br1nO+AMN3Tc=
++golang.org/x/net v0.22.0/go.mod h1:JKghWKKOSdJwpW2GEx0Ja7fmaKnMsbu+MWVZTokSYmg=
++golang.org/x/sys v0.18.0 h1:DBdB3niSjOA/O0blCZBqDefyWNYveAYMNF1Wum0DYQ4=
++golang.org/x/sys v0.18.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
++golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=
++golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
++golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
++google.golang.org/genproto/googleapis/rpc v0.0.0-20240123012728-ef4313101c80 h1:AjyfHzEPEFp/NpvfN5g+KDla3EMojjhRVZc1i7cj+oM=
++google.golang.org/genproto/googleapis/rpc v0.0.0-20240123012728-ef4313101c80/go.mod h1:PAREbraiVEVGVdTZsVWjSbbTtSyGbAgIIvni8a8CD5s=
++google.golang.org/grpc v1.62.0 h1:HQKZ/fa1bXkX1oFOvSjmZEUL8wLSaZTjCcLAlmZRtdk=
++google.golang.org/grpc v1.62.0/go.mod h1:IWTG0VlJLCh1SkC58F7np9ka9mx/WNkjl4PGJaiq+QE=
++google.golang.org/protobuf v1.26.0-rc.1/go.mod h1:jlhhOSvTdKEhbULTjvd4ARK9grFBp09yW+WbY/TyQbw=
++google.golang.org/protobuf v1.26.0/go.mod h1:9q0QmTI4eRPtz6boOQmLYwt+qCgq0jsYwAQnmE0givc=
++google.golang.org/protobuf v1.33.0 h1:uNO2rsAINq/JlFpSdYEKIZ0uKD/R9cpdv0T+yoGwGmI=
++google.golang.org/protobuf v1.33.0/go.mod h1:c6P6GXX6sHbq/GpV6MGZEdwhWPcYBgnhAHhKbcUYpos=
+diff --git a/load_test.yml b/load_test.yml
+new file mode 100644
+index 0000000..1cd62d2
+--- /dev/null
++++ b/load_test.yml
+@@ -0,0 +1,19 @@
++config:
++  # L'URL cible de notre Data Plane
++  target: "http://localhost:9000"
++  phases:
++    # Phase 1 : Echauffement (Warm up) - 5 utilisateurs par seconde pendant 10 secondes
++    - duration: 10
++      arrivalRate: 5
++      name: "Echauffement"
++    # Phase 2 : Charge soutenue - 20 utilisateurs par seconde pendant 30 secondes
++    - duration: 30
++      arrivalRate: 20
++      name: "Charge soutenue"
++scenarios:
++  - name: "Invocation Synchrone FaaS"
++    flow:
++      - post:
++          url: "/invoke/fonction-artillery"
++          json:
++            payload: "donnees-de-test"
+diff --git a/nginx.conf b/nginx.conf
+new file mode 100644
+index 0000000..322a009
+--- /dev/null
++++ b/nginx.conf
+@@ -0,0 +1,51 @@
++# ==============================================================================
++# Configuration NGINX pour le Cluster ngFaaS (Architecture Mimir)
++# ==============================================================================
++# Ce fichier configure NGINX comme Load Balancer frontal.
++# Il recoit les requetes des utilisateurs (sur le port 80) et les distribue
++# equitablement entre les differentes instances de Data Planes disponibles.
++
++# Definition du groupe de Data Planes (Le cluster backend)
++# L'administrateur systeme peut ajouter/retirer des lignes ici en fonction
++# du nombre d'instances de Data Planes lancees sur le serveur.
++upstream ngfaas_dataplanes {
++    # Stratégie par défaut : Round Robin (tour de role)
++    # On peut utiliser 'least_conn;' pour envoyer a l'instance ayant le moins de requetes actives.
++
++    server 127.0.0.1:8080; # Data Plane Instance 1
++    server 127.0.0.1:8081; # Data Plane Instance 2
++    server 127.0.0.1:8082; # Data Plane Instance 3 (A decommenter si on en lance 3)
++}
++
++server {
++    listen 80;
++    server_name ngfaas.ecole.fr localhost; # Le nom de domaine ou l'IP du serveur
++
++    # Configuration generale pour optimiser la latence (FaaS)
++    # On desactive la mise en buffer pour que les reponses synchrones
++    # arrivent le plus vite possible a l'utilisateur.
++    proxy_buffering off;
++    proxy_request_buffering off;
++
++    # On maintient la connexion en vie avec les Data Planes
++    # pour eviter le cout de la poignee de main TCP (TCP Handshake) a chaque requete.
++    keepalive_timeout 65;
++
++    # Point d'entree principal de la plateforme FaaS
++    location / {
++        # Redirection vers notre groupe de Data Planes
++        proxy_pass http://ngfaas_dataplanes;
++
++        # Transfert des en-tetes d'origine pour que le Data Plane
++        # connaisse l'IP reelle de l'utilisateur.
++        proxy_set_header Host $host;
++        proxy_set_header X-Real-IP $remote_addr;
++        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++        proxy_set_header X-Forwarded-Proto $scheme;
++
++        # Gestion des Timeouts (Si un Data Plane crash, NGINX passe au suivant apres 2 secondes)
++        proxy_connect_timeout 2s;
++        proxy_send_timeout 30s;
++        proxy_read_timeout 30s;
++    }
++}
+diff --git a/pkg/api/ngfaas.pb.go b/pkg/api/ngfaas.pb.go
+new file mode 100644
+index 0000000..46062dc
+--- /dev/null
++++ b/pkg/api/ngfaas.pb.go
+@@ -0,0 +1,730 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.28.1
++// 	protoc        v3.21.12
++// source: pkg/api/ngfaas.proto
++
++package api
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++// Messages d'infrastructure
++type RegisterWorkerRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	WorkerId  string `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
++	IpAddress string `protobuf:"bytes,2,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
++	Port      int32  `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"` // Port sur lequel le Worker ecoute les invocations gRPC
++}
++
++func (x *RegisterWorkerRequest) Reset() {
++	*x = RegisterWorkerRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[0]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RegisterWorkerRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RegisterWorkerRequest) ProtoMessage() {}
++
++func (x *RegisterWorkerRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[0]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RegisterWorkerRequest.ProtoReflect.Descriptor instead.
++func (*RegisterWorkerRequest) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{0}
++}
++
++func (x *RegisterWorkerRequest) GetWorkerId() string {
++	if x != nil {
++		return x.WorkerId
++	}
++	return ""
++}
++
++func (x *RegisterWorkerRequest) GetIpAddress() string {
++	if x != nil {
++		return x.IpAddress
++	}
++	return ""
++}
++
++func (x *RegisterWorkerRequest) GetPort() int32 {
++	if x != nil {
++		return x.Port
++	}
++	return 0
++}
++
++type RegisterDataPlaneRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	DataplaneId string `protobuf:"bytes,1,opt,name=dataplane_id,json=dataplaneId,proto3" json:"dataplane_id,omitempty"`
++	IpAddress   string `protobuf:"bytes,2,opt,name=ip_address,json=ipAddress,proto3" json:"ip_address,omitempty"`
++}
++
++func (x *RegisterDataPlaneRequest) Reset() {
++	*x = RegisterDataPlaneRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[1]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RegisterDataPlaneRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RegisterDataPlaneRequest) ProtoMessage() {}
++
++func (x *RegisterDataPlaneRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[1]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RegisterDataPlaneRequest.ProtoReflect.Descriptor instead.
++func (*RegisterDataPlaneRequest) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *RegisterDataPlaneRequest) GetDataplaneId() string {
++	if x != nil {
++		return x.DataplaneId
++	}
++	return ""
++}
++
++func (x *RegisterDataPlaneRequest) GetIpAddress() string {
++	if x != nil {
++		return x.IpAddress
++	}
++	return ""
++}
++
++type RegisterResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Success bool   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
++	Message string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
++}
++
++func (x *RegisterResponse) Reset() {
++	*x = RegisterResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[2]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RegisterResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RegisterResponse) ProtoMessage() {}
++
++func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[2]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RegisterResponse.ProtoReflect.Descriptor instead.
++func (*RegisterResponse) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{2}
++}
++
++func (x *RegisterResponse) GetSuccess() bool {
++	if x != nil {
++		return x.Success
++	}
++	return false
++}
++
++func (x *RegisterResponse) GetMessage() string {
++	if x != nil {
++		return x.Message
++	}
++	return ""
++}
++
++type RegisterFunctionRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	FunctionName  string `protobuf:"bytes,1,opt,name=function_name,json=functionName,proto3" json:"function_name,omitempty"`
++	ImageUrl      string `protobuf:"bytes,2,opt,name=image_url,json=imageUrl,proto3" json:"image_url,omitempty"`
++	MemoryLimitMb int32  `protobuf:"varint,3,opt,name=memory_limit_mb,json=memoryLimitMb,proto3" json:"memory_limit_mb,omitempty"`
++}
++
++func (x *RegisterFunctionRequest) Reset() {
++	*x = RegisterFunctionRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[3]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RegisterFunctionRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RegisterFunctionRequest) ProtoMessage() {}
++
++func (x *RegisterFunctionRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[3]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RegisterFunctionRequest.ProtoReflect.Descriptor instead.
++func (*RegisterFunctionRequest) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *RegisterFunctionRequest) GetFunctionName() string {
++	if x != nil {
++		return x.FunctionName
++	}
++	return ""
++}
++
++func (x *RegisterFunctionRequest) GetImageUrl() string {
++	if x != nil {
++		return x.ImageUrl
++	}
++	return ""
++}
++
++func (x *RegisterFunctionRequest) GetMemoryLimitMb() int32 {
++	if x != nil {
++		return x.MemoryLimitMb
++	}
++	return 0
++}
++
++type HeartbeatRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	ComponentId   string `protobuf:"bytes,1,opt,name=component_id,json=componentId,proto3" json:"component_id,omitempty"`
++	ComponentType string `protobuf:"bytes,2,opt,name=component_type,json=componentType,proto3" json:"component_type,omitempty"`
++	Status        string `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
++}
++
++func (x *HeartbeatRequest) Reset() {
++	*x = HeartbeatRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[4]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *HeartbeatRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*HeartbeatRequest) ProtoMessage() {}
++
++func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[4]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
++func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{4}
++}
++
++func (x *HeartbeatRequest) GetComponentId() string {
++	if x != nil {
++		return x.ComponentId
++	}
++	return ""
++}
++
++func (x *HeartbeatRequest) GetComponentType() string {
++	if x != nil {
++		return x.ComponentType
++	}
++	return ""
++}
++
++func (x *HeartbeatRequest) GetStatus() string {
++	if x != nil {
++		return x.Status
++	}
++	return ""
++}
++
++type HeartbeatResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Acknowledged bool `protobuf:"varint,1,opt,name=acknowledged,proto3" json:"acknowledged,omitempty"`
++}
++
++func (x *HeartbeatResponse) Reset() {
++	*x = HeartbeatResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[5]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *HeartbeatResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*HeartbeatResponse) ProtoMessage() {}
++
++func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[5]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
++func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{5}
++}
++
++func (x *HeartbeatResponse) GetAcknowledged() bool {
++	if x != nil {
++		return x.Acknowledged
++	}
++	return false
++}
++
++type InvokeRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	FunctionName string `protobuf:"bytes,1,opt,name=function_name,json=functionName,proto3" json:"function_name,omitempty"`
++	Payload      []byte `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"` // Les donnees json de la requete utilisateur
++}
++
++func (x *InvokeRequest) Reset() {
++	*x = InvokeRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[6]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *InvokeRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*InvokeRequest) ProtoMessage() {}
++
++func (x *InvokeRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[6]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use InvokeRequest.ProtoReflect.Descriptor instead.
++func (*InvokeRequest) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{6}
++}
++
++func (x *InvokeRequest) GetFunctionName() string {
++	if x != nil {
++		return x.FunctionName
++	}
++	return ""
++}
++
++func (x *InvokeRequest) GetPayload() []byte {
++	if x != nil {
++		return x.Payload
++	}
++	return nil
++}
++
++type InvokeResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Success      bool   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
++	Result       string `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`                                 // Le retour de la fonction
++	ExecutionNic string `protobuf:"bytes,3,opt,name=execution_nic,json=executionNic,proto3" json:"execution_nic,omitempty"` // L'IP virtuelle utilisee (pour tracer le Cold/Warm start)
++}
++
++func (x *InvokeResponse) Reset() {
++	*x = InvokeResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_pkg_api_ngfaas_proto_msgTypes[7]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *InvokeResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*InvokeResponse) ProtoMessage() {}
++
++func (x *InvokeResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_pkg_api_ngfaas_proto_msgTypes[7]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use InvokeResponse.ProtoReflect.Descriptor instead.
++func (*InvokeResponse) Descriptor() ([]byte, []int) {
++	return file_pkg_api_ngfaas_proto_rawDescGZIP(), []int{7}
++}
++
++func (x *InvokeResponse) GetSuccess() bool {
++	if x != nil {
++		return x.Success
++	}
++	return false
++}
++
++func (x *InvokeResponse) GetResult() string {
++	if x != nil {
++		return x.Result
++	}
++	return ""
++}
++
++func (x *InvokeResponse) GetExecutionNic() string {
++	if x != nil {
++		return x.ExecutionNic
++	}
++	return ""
++}
++
++var File_pkg_api_ngfaas_proto protoreflect.FileDescriptor
++
++var file_pkg_api_ngfaas_proto_rawDesc = []byte{
++	0x0a, 0x14, 0x70, 0x6b, 0x67, 0x2f, 0x61, 0x70, 0x69, 0x2f, 0x6e, 0x67, 0x66, 0x61, 0x61, 0x73,
++	0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x03, 0x61, 0x70, 0x69, 0x22, 0x67, 0x0a, 0x15, 0x52,
++	0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x57, 0x6f, 0x72, 0x6b, 0x65, 0x72, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x12, 0x1b, 0x0a, 0x09, 0x77, 0x6f, 0x72, 0x6b, 0x65, 0x72, 0x5f, 0x69,
++	0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x77, 0x6f, 0x72, 0x6b, 0x65, 0x72, 0x49,
++	0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x69, 0x70, 0x5f, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x18,
++	0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x69, 0x70, 0x41, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73,
++	0x12, 0x12, 0x0a, 0x04, 0x70, 0x6f, 0x72, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x05, 0x52, 0x04,
++	0x70, 0x6f, 0x72, 0x74, 0x22, 0x5c, 0x0a, 0x18, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72,
++	0x44, 0x61, 0x74, 0x61, 0x50, 0x6c, 0x61, 0x6e, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x12, 0x21, 0x0a, 0x0c, 0x64, 0x61, 0x74, 0x61, 0x70, 0x6c, 0x61, 0x6e, 0x65, 0x5f, 0x69, 0x64,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x64, 0x61, 0x74, 0x61, 0x70, 0x6c, 0x61, 0x6e,
++	0x65, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x69, 0x70, 0x5f, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73,
++	0x73, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x69, 0x70, 0x41, 0x64, 0x64, 0x72, 0x65,
++	0x73, 0x73, 0x22, 0x46, 0x0a, 0x10, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x52, 0x65,
++	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x18, 0x0a, 0x07, 0x73, 0x75, 0x63, 0x63, 0x65, 0x73,
++	0x73, 0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x07, 0x73, 0x75, 0x63, 0x63, 0x65, 0x73, 0x73,
++	0x12, 0x18, 0x0a, 0x07, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x07, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x22, 0x83, 0x01, 0x0a, 0x17, 0x52,
++	0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x46, 0x75, 0x6e, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x52,
++	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x23, 0x0a, 0x0d, 0x66, 0x75, 0x6e, 0x63, 0x74, 0x69,
++	0x6f, 0x6e, 0x5f, 0x6e, 0x61, 0x6d, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x66,
++	0x75, 0x6e, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x4e, 0x61, 0x6d, 0x65, 0x12, 0x1b, 0x0a, 0x09, 0x69,
++	0x6d, 0x61, 0x67, 0x65, 0x5f, 0x75, 0x72, 0x6c, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08,
++	0x69, 0x6d, 0x61, 0x67, 0x65, 0x55, 0x72, 0x6c, 0x12, 0x26, 0x0a, 0x0f, 0x6d, 0x65, 0x6d, 0x6f,
++	0x72, 0x79, 0x5f, 0x6c, 0x69, 0x6d, 0x69, 0x74, 0x5f, 0x6d, 0x62, 0x18, 0x03, 0x20, 0x01, 0x28,
++	0x05, 0x52, 0x0d, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x4c, 0x69, 0x6d, 0x69, 0x74, 0x4d, 0x62,
++	0x22, 0x74, 0x0a, 0x10, 0x48, 0x65, 0x61, 0x72, 0x74, 0x62, 0x65, 0x61, 0x74, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x12, 0x21, 0x0a, 0x0c, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e,
++	0x74, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x63, 0x6f, 0x6d, 0x70,
++	0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x49, 0x64, 0x12, 0x25, 0x0a, 0x0e, 0x63, 0x6f, 0x6d, 0x70, 0x6f,
++	0x6e, 0x65, 0x6e, 0x74, 0x5f, 0x74, 0x79, 0x70, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x0d, 0x63, 0x6f, 0x6d, 0x70, 0x6f, 0x6e, 0x65, 0x6e, 0x74, 0x54, 0x79, 0x70, 0x65, 0x12, 0x16,
++	0x0a, 0x06, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06,
++	0x73, 0x74, 0x61, 0x74, 0x75, 0x73, 0x22, 0x37, 0x0a, 0x11, 0x48, 0x65, 0x61, 0x72, 0x74, 0x62,
++	0x65, 0x61, 0x74, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x22, 0x0a, 0x0c, 0x61,
++	0x63, 0x6b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28,
++	0x08, 0x52, 0x0c, 0x61, 0x63, 0x6b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x64, 0x22,
++	0x4e, 0x0a, 0x0d, 0x49, 0x6e, 0x76, 0x6f, 0x6b, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x12, 0x23, 0x0a, 0x0d, 0x66, 0x75, 0x6e, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x6e, 0x61, 0x6d,
++	0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x66, 0x75, 0x6e, 0x63, 0x74, 0x69, 0x6f,
++	0x6e, 0x4e, 0x61, 0x6d, 0x65, 0x12, 0x18, 0x0a, 0x07, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64,
++	0x18, 0x02, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x07, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x22,
++	0x67, 0x0a, 0x0e, 0x49, 0x6e, 0x76, 0x6f, 0x6b, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x12, 0x18, 0x0a, 0x07, 0x73, 0x75, 0x63, 0x63, 0x65, 0x73, 0x73, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x08, 0x52, 0x07, 0x73, 0x75, 0x63, 0x63, 0x65, 0x73, 0x73, 0x12, 0x16, 0x0a, 0x06, 0x72,
++	0x65, 0x73, 0x75, 0x6c, 0x74, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x72, 0x65, 0x73,
++	0x75, 0x6c, 0x74, 0x12, 0x23, 0x0a, 0x0d, 0x65, 0x78, 0x65, 0x63, 0x75, 0x74, 0x69, 0x6f, 0x6e,
++	0x5f, 0x6e, 0x69, 0x63, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x65, 0x78, 0x65, 0x63,
++	0x75, 0x74, 0x69, 0x6f, 0x6e, 0x4e, 0x69, 0x63, 0x32, 0xac, 0x02, 0x0a, 0x11, 0x43, 0x6f, 0x6e,
++	0x74, 0x72, 0x6f, 0x6c, 0x6c, 0x65, 0x72, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x43,
++	0x0a, 0x0e, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x57, 0x6f, 0x72, 0x6b, 0x65, 0x72,
++	0x12, 0x1a, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x57,
++	0x6f, 0x72, 0x6b, 0x65, 0x72, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x15, 0x2e, 0x61,
++	0x70, 0x69, 0x2e, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x52, 0x65, 0x73, 0x70, 0x6f,
++	0x6e, 0x73, 0x65, 0x12, 0x49, 0x0a, 0x11, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x44,
++	0x61, 0x74, 0x61, 0x50, 0x6c, 0x61, 0x6e, 0x65, 0x12, 0x1d, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x52,
++	0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x44, 0x61, 0x74, 0x61, 0x50, 0x6c, 0x61, 0x6e, 0x65,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x15, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x52, 0x65,
++	0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x47,
++	0x0a, 0x10, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x46, 0x75, 0x6e, 0x63, 0x74, 0x69,
++	0x6f, 0x6e, 0x12, 0x1c, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65,
++	0x72, 0x46, 0x75, 0x6e, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x1a, 0x15, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x52,
++	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x3e, 0x0a, 0x0d, 0x53, 0x65, 0x6e, 0x64, 0x48,
++	0x65, 0x61, 0x72, 0x74, 0x62, 0x65, 0x61, 0x74, 0x12, 0x15, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x48,
++	0x65, 0x61, 0x72, 0x74, 0x62, 0x65, 0x61, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a,
++	0x16, 0x2e, 0x61, 0x70, 0x69, 0x2e, 0x48, 0x65, 0x61, 0x72, 0x74, 0x62, 0x65, 0x61, 0x74, 0x52,
++	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x32, 0x4a, 0x0a, 0x0d, 0x57, 0x6f, 0x72, 0x6b, 0x65,
++	0x72, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x39, 0x0a, 0x0e, 0x49, 0x6e, 0x76, 0x6f,
++	0x6b, 0x65, 0x46, 0x75, 0x6e, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x12, 0x2e, 0x61, 0x70, 0x69,
++	0x2e, 0x49, 0x6e, 0x76, 0x6f, 0x6b, 0x65, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x13,
++	0x2e, 0x61, 0x70, 0x69, 0x2e, 0x49, 0x6e, 0x76, 0x6f, 0x6b, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f,
++	0x6e, 0x73, 0x65, 0x42, 0x10, 0x5a, 0x0e, 0x6e, 0x67, 0x66, 0x61, 0x61, 0x73, 0x2f, 0x70, 0x6b,
++	0x67, 0x2f, 0x61, 0x70, 0x69, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
++}
++
++var (
++	file_pkg_api_ngfaas_proto_rawDescOnce sync.Once
++	file_pkg_api_ngfaas_proto_rawDescData = file_pkg_api_ngfaas_proto_rawDesc
++)
++
++func file_pkg_api_ngfaas_proto_rawDescGZIP() []byte {
++	file_pkg_api_ngfaas_proto_rawDescOnce.Do(func() {
++		file_pkg_api_ngfaas_proto_rawDescData = protoimpl.X.CompressGZIP(file_pkg_api_ngfaas_proto_rawDescData)
++	})
++	return file_pkg_api_ngfaas_proto_rawDescData
++}
++
++var file_pkg_api_ngfaas_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
++var file_pkg_api_ngfaas_proto_goTypes = []interface{}{
++	(*RegisterWorkerRequest)(nil),    // 0: api.RegisterWorkerRequest
++	(*RegisterDataPlaneRequest)(nil), // 1: api.RegisterDataPlaneRequest
++	(*RegisterResponse)(nil),         // 2: api.RegisterResponse
++	(*RegisterFunctionRequest)(nil),  // 3: api.RegisterFunctionRequest
++	(*HeartbeatRequest)(nil),         // 4: api.HeartbeatRequest
++	(*HeartbeatResponse)(nil),        // 5: api.HeartbeatResponse
++	(*InvokeRequest)(nil),            // 6: api.InvokeRequest
++	(*InvokeResponse)(nil),           // 7: api.InvokeResponse
++}
++var file_pkg_api_ngfaas_proto_depIdxs = []int32{
++	0, // 0: api.ControllerService.RegisterWorker:input_type -> api.RegisterWorkerRequest
++	1, // 1: api.ControllerService.RegisterDataPlane:input_type -> api.RegisterDataPlaneRequest
++	3, // 2: api.ControllerService.RegisterFunction:input_type -> api.RegisterFunctionRequest
++	4, // 3: api.ControllerService.SendHeartbeat:input_type -> api.HeartbeatRequest
++	6, // 4: api.WorkerService.InvokeFunction:input_type -> api.InvokeRequest
++	2, // 5: api.ControllerService.RegisterWorker:output_type -> api.RegisterResponse
++	2, // 6: api.ControllerService.RegisterDataPlane:output_type -> api.RegisterResponse
++	2, // 7: api.ControllerService.RegisterFunction:output_type -> api.RegisterResponse
++	5, // 8: api.ControllerService.SendHeartbeat:output_type -> api.HeartbeatResponse
++	7, // 9: api.WorkerService.InvokeFunction:output_type -> api.InvokeResponse
++	5, // [5:10] is the sub-list for method output_type
++	0, // [0:5] is the sub-list for method input_type
++	0, // [0:0] is the sub-list for extension type_name
++	0, // [0:0] is the sub-list for extension extendee
++	0, // [0:0] is the sub-list for field type_name
++}
++
++func init() { file_pkg_api_ngfaas_proto_init() }
++func file_pkg_api_ngfaas_proto_init() {
++	if File_pkg_api_ngfaas_proto != nil {
++		return
++	}
++	if !protoimpl.UnsafeEnabled {
++		file_pkg_api_ngfaas_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RegisterWorkerRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RegisterDataPlaneRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RegisterResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RegisterFunctionRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*HeartbeatRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*HeartbeatResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*InvokeRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_pkg_api_ngfaas_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*InvokeResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++	}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: file_pkg_api_ngfaas_proto_rawDesc,
++			NumEnums:      0,
++			NumMessages:   8,
++			NumExtensions: 0,
++			NumServices:   2,
++		},
++		GoTypes:           file_pkg_api_ngfaas_proto_goTypes,
++		DependencyIndexes: file_pkg_api_ngfaas_proto_depIdxs,
++		MessageInfos:      file_pkg_api_ngfaas_proto_msgTypes,
++	}.Build()
++	File_pkg_api_ngfaas_proto = out.File
++	file_pkg_api_ngfaas_proto_rawDesc = nil
++	file_pkg_api_ngfaas_proto_goTypes = nil
++	file_pkg_api_ngfaas_proto_depIdxs = nil
++}
+diff --git a/pkg/api/ngfaas.proto b/pkg/api/ngfaas.proto
+new file mode 100644
+index 0000000..6284b72
+--- /dev/null
++++ b/pkg/api/ngfaas.proto
+@@ -0,0 +1,74 @@
++syntax = "proto3";
++
++package api;
++
++// Specifie ou le code Go genere doit etre place
++option go_package = "ngfaas/pkg/api";
++
++// =========================================================
++// SERVICE DU CONTROL PLANE (Le Cerveau)
++// =========================================================
++service ControllerService {
++  // Enregistrement des composants d'infrastructure
++  rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterResponse);
++  rpc RegisterDataPlane (RegisterDataPlaneRequest) returns (RegisterResponse);
++
++  // Enregistrement des fonctions par les clients
++  rpc RegisterFunction (RegisterFunctionRequest) returns (RegisterResponse);
++
++  // Heartbeats (peut aussi se faire via NATS)
++  rpc SendHeartbeat (HeartbeatRequest) returns (HeartbeatResponse);
++}
++
++// Messages d'infrastructure
++message RegisterWorkerRequest {
++  string worker_id = 1;
++  string ip_address = 2;
++  int32 port = 3; // Port sur lequel le Worker ecoute les invocations gRPC
++}
++
++message RegisterDataPlaneRequest {
++  string dataplane_id = 1;
++  string ip_address = 2;
++}
++
++message RegisterResponse {
++  bool success = 1;
++  string message = 2;
++}
++
++message RegisterFunctionRequest {
++  string function_name = 1;
++  string image_url = 2;
++  int32 memory_limit_mb = 3;
++}
++
++message HeartbeatRequest {
++  string component_id = 1;
++  string component_type = 2;
++  string status = 3;
++}
++
++message HeartbeatResponse {
++  bool acknowledged = 1;
++}
++
++// =========================================================
++// SERVICE DU WORKER (Le Data Path Mimir)
++// =========================================================
++// Ce service est expose par chaque Worker. Le Data Plane l'utilise
++// pour envoyer directement les requetes d'execution a la vitesse gRPC.
++service WorkerService {
++  rpc InvokeFunction (InvokeRequest) returns (InvokeResponse);
++}
++
++message InvokeRequest {
++  string function_name = 1;
++  bytes payload = 2; // Les donnees json de la requete utilisateur
++}
++
++message InvokeResponse {
++  bool success = 1;
++  string result = 2; // Le retour de la fonction
++  string execution_nic = 3; // L'IP virtuelle utilisee (pour tracer le Cold/Warm start)
++}
+diff --git a/pkg/api/ngfaas_grpc.pb.go b/pkg/api/ngfaas_grpc.pb.go
+new file mode 100644
+index 0000000..d7db0dc
+--- /dev/null
++++ b/pkg/api/ngfaas_grpc.pb.go
+@@ -0,0 +1,305 @@
++// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
++// versions:
++// - protoc-gen-go-grpc v1.2.0
++// - protoc             v3.21.12
++// source: pkg/api/ngfaas.proto
++
++package api
++
++import (
++	context "context"
++	grpc "google.golang.org/grpc"
++	codes "google.golang.org/grpc/codes"
++	status "google.golang.org/grpc/status"
++)
++
++// This is a compile-time assertion to ensure that this generated file
++// is compatible with the grpc package it is being compiled against.
++// Requires gRPC-Go v1.32.0 or later.
++const _ = grpc.SupportPackageIsVersion7
++
++// ControllerServiceClient is the client API for ControllerService service.
++//
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++type ControllerServiceClient interface {
++	// Enregistrement des composants d'infrastructure
++	RegisterWorker(ctx context.Context, in *RegisterWorkerRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
++	RegisterDataPlane(ctx context.Context, in *RegisterDataPlaneRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
++	// Enregistrement des fonctions par les clients
++	RegisterFunction(ctx context.Context, in *RegisterFunctionRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
++	// Heartbeats (peut aussi se faire via NATS)
++	SendHeartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
++}
++
++type controllerServiceClient struct {
++	cc grpc.ClientConnInterface
++}
++
++func NewControllerServiceClient(cc grpc.ClientConnInterface) ControllerServiceClient {
++	return &controllerServiceClient{cc}
++}
++
++func (c *controllerServiceClient) RegisterWorker(ctx context.Context, in *RegisterWorkerRequest, opts ...grpc.CallOption) (*RegisterResponse, error) {
++	out := new(RegisterResponse)
++	err := c.cc.Invoke(ctx, "/api.ControllerService/RegisterWorker", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *controllerServiceClient) RegisterDataPlane(ctx context.Context, in *RegisterDataPlaneRequest, opts ...grpc.CallOption) (*RegisterResponse, error) {
++	out := new(RegisterResponse)
++	err := c.cc.Invoke(ctx, "/api.ControllerService/RegisterDataPlane", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *controllerServiceClient) RegisterFunction(ctx context.Context, in *RegisterFunctionRequest, opts ...grpc.CallOption) (*RegisterResponse, error) {
++	out := new(RegisterResponse)
++	err := c.cc.Invoke(ctx, "/api.ControllerService/RegisterFunction", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *controllerServiceClient) SendHeartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
++	out := new(HeartbeatResponse)
++	err := c.cc.Invoke(ctx, "/api.ControllerService/SendHeartbeat", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// ControllerServiceServer is the server API for ControllerService service.
++// All implementations must embed UnimplementedControllerServiceServer
++// for forward compatibility
++type ControllerServiceServer interface {
++	// Enregistrement des composants d'infrastructure
++	RegisterWorker(context.Context, *RegisterWorkerRequest) (*RegisterResponse, error)
++	RegisterDataPlane(context.Context, *RegisterDataPlaneRequest) (*RegisterResponse, error)
++	// Enregistrement des fonctions par les clients
++	RegisterFunction(context.Context, *RegisterFunctionRequest) (*RegisterResponse, error)
++	// Heartbeats (peut aussi se faire via NATS)
++	SendHeartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
++	mustEmbedUnimplementedControllerServiceServer()
++}
++
++// UnimplementedControllerServiceServer must be embedded to have forward compatible implementations.
++type UnimplementedControllerServiceServer struct {
++}
++
++func (UnimplementedControllerServiceServer) RegisterWorker(context.Context, *RegisterWorkerRequest) (*RegisterResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RegisterWorker not implemented")
++}
++func (UnimplementedControllerServiceServer) RegisterDataPlane(context.Context, *RegisterDataPlaneRequest) (*RegisterResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RegisterDataPlane not implemented")
++}
++func (UnimplementedControllerServiceServer) RegisterFunction(context.Context, *RegisterFunctionRequest) (*RegisterResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RegisterFunction not implemented")
++}
++func (UnimplementedControllerServiceServer) SendHeartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method SendHeartbeat not implemented")
++}
++func (UnimplementedControllerServiceServer) mustEmbedUnimplementedControllerServiceServer() {}
++
++// UnsafeControllerServiceServer may be embedded to opt out of forward compatibility for this service.
++// Use of this interface is not recommended, as added methods to ControllerServiceServer will
++// result in compilation errors.
++type UnsafeControllerServiceServer interface {
++	mustEmbedUnimplementedControllerServiceServer()
++}
++
++func RegisterControllerServiceServer(s grpc.ServiceRegistrar, srv ControllerServiceServer) {
++	s.RegisterService(&ControllerService_ServiceDesc, srv)
++}
++
++func _ControllerService_RegisterWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RegisterWorkerRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ControllerServiceServer).RegisterWorker(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.ControllerService/RegisterWorker",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ControllerServiceServer).RegisterWorker(ctx, req.(*RegisterWorkerRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _ControllerService_RegisterDataPlane_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RegisterDataPlaneRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ControllerServiceServer).RegisterDataPlane(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.ControllerService/RegisterDataPlane",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ControllerServiceServer).RegisterDataPlane(ctx, req.(*RegisterDataPlaneRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _ControllerService_RegisterFunction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RegisterFunctionRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ControllerServiceServer).RegisterFunction(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.ControllerService/RegisterFunction",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ControllerServiceServer).RegisterFunction(ctx, req.(*RegisterFunctionRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _ControllerService_SendHeartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(HeartbeatRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(ControllerServiceServer).SendHeartbeat(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.ControllerService/SendHeartbeat",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(ControllerServiceServer).SendHeartbeat(ctx, req.(*HeartbeatRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++// ControllerService_ServiceDesc is the grpc.ServiceDesc for ControllerService service.
++// It's only intended for direct use with grpc.RegisterService,
++// and not to be introspected or modified (even as a copy)
++var ControllerService_ServiceDesc = grpc.ServiceDesc{
++	ServiceName: "api.ControllerService",
++	HandlerType: (*ControllerServiceServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "RegisterWorker",
++			Handler:    _ControllerService_RegisterWorker_Handler,
++		},
++		{
++			MethodName: "RegisterDataPlane",
++			Handler:    _ControllerService_RegisterDataPlane_Handler,
++		},
++		{
++			MethodName: "RegisterFunction",
++			Handler:    _ControllerService_RegisterFunction_Handler,
++		},
++		{
++			MethodName: "SendHeartbeat",
++			Handler:    _ControllerService_SendHeartbeat_Handler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "pkg/api/ngfaas.proto",
++}
++
++// WorkerServiceClient is the client API for WorkerService service.
++//
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++type WorkerServiceClient interface {
++	InvokeFunction(ctx context.Context, in *InvokeRequest, opts ...grpc.CallOption) (*InvokeResponse, error)
++}
++
++type workerServiceClient struct {
++	cc grpc.ClientConnInterface
++}
++
++func NewWorkerServiceClient(cc grpc.ClientConnInterface) WorkerServiceClient {
++	return &workerServiceClient{cc}
++}
++
++func (c *workerServiceClient) InvokeFunction(ctx context.Context, in *InvokeRequest, opts ...grpc.CallOption) (*InvokeResponse, error) {
++	out := new(InvokeResponse)
++	err := c.cc.Invoke(ctx, "/api.WorkerService/InvokeFunction", in, out, opts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// WorkerServiceServer is the server API for WorkerService service.
++// All implementations must embed UnimplementedWorkerServiceServer
++// for forward compatibility
++type WorkerServiceServer interface {
++	InvokeFunction(context.Context, *InvokeRequest) (*InvokeResponse, error)
++	mustEmbedUnimplementedWorkerServiceServer()
++}
++
++// UnimplementedWorkerServiceServer must be embedded to have forward compatible implementations.
++type UnimplementedWorkerServiceServer struct {
++}
++
++func (UnimplementedWorkerServiceServer) InvokeFunction(context.Context, *InvokeRequest) (*InvokeResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method InvokeFunction not implemented")
++}
++func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
++
++// UnsafeWorkerServiceServer may be embedded to opt out of forward compatibility for this service.
++// Use of this interface is not recommended, as added methods to WorkerServiceServer will
++// result in compilation errors.
++type UnsafeWorkerServiceServer interface {
++	mustEmbedUnimplementedWorkerServiceServer()
++}
++
++func RegisterWorkerServiceServer(s grpc.ServiceRegistrar, srv WorkerServiceServer) {
++	s.RegisterService(&WorkerService_ServiceDesc, srv)
++}
++
++func _WorkerService_InvokeFunction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(InvokeRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(WorkerServiceServer).InvokeFunction(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: "/api.WorkerService/InvokeFunction",
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(WorkerServiceServer).InvokeFunction(ctx, req.(*InvokeRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++// WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
++// It's only intended for direct use with grpc.RegisterService,
++// and not to be introspected or modified (even as a copy)
++var WorkerService_ServiceDesc = grpc.ServiceDesc{
++	ServiceName: "api.WorkerService",
++	HandlerType: (*WorkerServiceServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "InvokeFunction",
++			Handler:    _WorkerService_InvokeFunction_Handler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "pkg/api/ngfaas.proto",
++}
+diff --git a/test_script.sh b/test_script.sh
+new file mode 100755
+index 0000000..312ed68
+--- /dev/null
++++ b/test_script.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++# Ce script compile les binaires pour Linux
++export GOOS=linux
++export GOARCH=amd64
++
++echo "Création du dossier de build..."
++mkdir -p build
++
++echo "Compiling controller..."
++go build -o build/controller cmd/controller/main.go
++echo "Compiling dataplane..."
++go build -o build/dataplane cmd/dataplane/main.go
++echo "Compiling worker..."
++go build -o build/worker cmd/worker/main.go
++
++echo "Build successful. You can find the binaries in the build/ directory."
