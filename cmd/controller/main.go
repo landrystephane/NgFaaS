@@ -24,7 +24,7 @@ type server struct {
 }
 
 func (s *server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerRequest) (*pb.RegisterResponse, error) {
-	fmt.Printf("👋 NOUVEAU WORKER ENREGISTRE : ID=%s, IP=%s, Port=%d\n", req.WorkerId, req.IpAddress, req.Port)
+	fmt.Printf("NOUVEAU WORKER ENREGISTRE : ID=%s, IP=%s, Port=%d\n", req.WorkerId, req.IpAddress, req.Port)
 
 	key := fmt.Sprintf("worker:%s", req.WorkerId)
 	val := fmt.Sprintf("%s:%d", req.IpAddress, req.Port)
@@ -34,7 +34,7 @@ func (s *server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerReque
 }
 
 func (s *server) RegisterDataPlane(ctx context.Context, req *pb.RegisterDataPlaneRequest) (*pb.RegisterResponse, error) {
-	fmt.Printf("👋 NOUVEAU DATAPLANE ENREGISTRE : ID=%s\n", req.DataplaneId)
+	fmt.Printf("NOUVEAU DATAPLANE ENREGISTRE : ID=%s\n", req.DataplaneId)
 	s.rdb.Set(ctx, fmt.Sprintf("dataplane:%s", req.DataplaneId), req.IpAddress, 0)
 	return &pb.RegisterResponse{Success: true}, nil
 }
@@ -48,17 +48,17 @@ func (s *server) SendHeartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*
 }
 
 func main() {
-	fmt.Println("👑 Demarrage du Controller ngFaaS (Control Plane & Autoscaler)...")
+	fmt.Println(" Demarrage du Controller ngFaaS (Control Plane & Autoscaler)...")
 
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("❌ Redis injoignable: %v", err)
+		log.Fatalf(" Redis injoignable: %v", err)
 	}
 
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("❌ NATS injoignable: %v", err)
+		log.Fatalf(" NATS injoignable: %v", err)
 	}
 	defer nc.Close()
 
@@ -100,7 +100,7 @@ func main() {
 
 			err := cmd.Start()
 			if err != nil {
-				fmt.Printf("❌ Erreur Autoscaler: %v\n", err)
+				fmt.Printf("Erreur Autoscaler: %v\n", err)
 			} else {
 				// Pour eviter les processus zombies, on lance une goroutine qui attend la fin du processus
 				go func() {
@@ -120,14 +120,14 @@ func main() {
 	// Demarrage Serveur gRPC
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
-		log.Fatalf("❌ Erreur reseau: %v", err)
+		log.Fatalf(" Erreur reseau: %v", err)
 	}
 
 	s := grpc.NewServer()
 	pb.RegisterControllerServiceServer(s, &server{rdb: rdb, nc: nc})
 
-	fmt.Println("📡 Le Controller ecoute sur le port 50051...")
+	fmt.Println(" Le Controller ecoute sur le port 50051...")
 	if err := s.Serve(lis); err != nil {
-		log.Fatalf("❌ Erreur gRPC: %v", err)
+		log.Fatalf(" Erreur gRPC: %v", err)
 	}
 }

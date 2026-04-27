@@ -1,10 +1,10 @@
-# Prototype ngFaaS 🚀
+# Prototype ngFaaS
 
 Ce projet est un prototype d'architecture de plateforme **Function-as-a-Service (FaaS)** distribuée, développé dans le cadre du projet de recherche **ngFaaS**.
 
 L'architecture est inspirée des concepts mis en avant dans la recherche "Mimir", visant à réduire la latence des *Cold Starts* en décentralisant la prise de décision vers le plan de données (Data Plane).
 
-## 🏗️ Architecture du Système
+##  Architecture du Système
 
 Le système est composé de trois microservices principaux qui communiquent via **gRPC**, **Redis** et **NATS** :
 
@@ -14,7 +14,7 @@ Le système est composé de trois microservices principaux qui communiquent via 
 
 ---
 
-## 🛠️ Prérequis et Installation
+##  Prérequis et Installation
 
 Pour faire tourner ce projet, vous aurez besoin de :
 
@@ -29,7 +29,7 @@ go mod tidy
 
 ---
 
-## 🚀 Exécution du Projet
+##  Exécution du Projet
 
 Assurez-vous que **Redis** et **NATS Server** tournent.
 Lancez les composants dans cet ordre dans des terminaux séparés :
@@ -49,7 +49,7 @@ go run ./cmd/worker
 
 ---
 
-## 🧪 Comment tester ?
+##  Comment tester ?
 
 Le Data Plane écoute sur le port **8080**.
 

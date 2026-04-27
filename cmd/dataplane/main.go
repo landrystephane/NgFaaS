@@ -41,36 +41,42 @@ type HeartbeatMsg struct {
 	Functions map[string]string `json:"functions"`
 }
 
+// ClientConn wrappe le client et la connexion pour permettre une fermeture propre
+type ClientConn struct {
+	Client pb.WorkerServiceClient
+	Conn   *grpc.ClientConn
+}
+
 // ConnPool maintient les connexions gRPC ouvertes vers les Workers pour des performances extremes
 var (
 	connPoolMutex sync.RWMutex
-	workerClients = make(map[string]pb.WorkerServiceClient)
+	workerClients = make(map[string]ClientConn)
 )
 
 func getWorkerClient(address string) (pb.WorkerServiceClient, error) {
 	connPoolMutex.RLock()
-	client, exists := workerClients[address]
+	cc, exists := workerClients[address]
 	connPoolMutex.RUnlock()
 
 	if exists {
-		return client, nil
+		return cc.Client, nil
 	}
 
 	connPoolMutex.Lock()
 	defer connPoolMutex.Unlock()
 	// Double-check locking
-	if client, exists := workerClients[address]; exists {
-		return client, nil
+	if cc, exists := workerClients[address]; exists {
+		return cc.Client, nil
 	}
 
-	fmt.Printf("🔌 [DataPlane] Etablissement d'une nouvelle connexion gRPC persistante vers %s\n", address)
+	fmt.Printf("[DataPlane] Etablissement d'une nouvelle connexion gRPC persistante vers %s\n", address)
 	conn, err := grpc.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
 
 	newClient := pb.NewWorkerServiceClient(conn)
-	workerClients[address] = newClient
+	workerClients[address] = ClientConn{Client: newClient, Conn: conn}
 	return newClient, nil
 }
 
@@ -85,14 +91,14 @@ func main() {
 		port = "8080"
 	}
 
-	fmt.Printf("🚀 Demarrage du Data Plane %s sur le port %s (HTTP -> gRPC Bridge)...\n", dpID, port)
+	fmt.Printf("Demarrage du Data Plane %s sur le port %s (HTTP -> gRPC Bridge)...\n", dpID, port)
 
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 
 	// Connexion au Controller (gRPC)
 	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("❌ Impossible de se connecter au Controller : %v", err)
+		log.Fatalf(" Impossible de se connecter au Controller : %v", err)
 	}
 	defer conn.Close()
 	client := pb.NewControllerServiceClient(conn)
@@ -101,13 +107,13 @@ func main() {
 	defer cancel()
 	_, err = client.RegisterDataPlane(ctx, &pb.RegisterDataPlaneRequest{DataplaneId: dpID, IpAddress: "127.0.0.1"})
 	if err != nil {
-		log.Fatalf("❌ Erreur enregistrement DP: %v", err)
+		log.Fatalf(" Erreur enregistrement DP: %v", err)
 	}
 
 	// Connexion NATS
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("❌ Impossible de se connecter a NATS : %v", err)
+		log.Fatalf(" Impossible de se connecter a NATS : %v", err)
 	}
 	defer nc.Close()
 
@@ -122,7 +128,7 @@ func main() {
 
 		routingTable.Lock()
 		if _, exists := routingTable.workers[hb.WorkerID]; !exists {
-			fmt.Printf("📥 [DataPlane %s] Nouveau Worker detecte: %s\n", dpID, hb.WorkerID)
+			fmt.Printf("[DataPlane %s] Nouveau Worker detecte: %s\n", dpID, hb.WorkerID)
 		}
 		routingTable.workers[hb.WorkerID] = &WorkerMeta{
 			ID:        hb.WorkerID,
@@ -141,15 +147,15 @@ func main() {
 			now := time.Now()
 			for id, meta := range routingTable.workers {
 				if now.Sub(meta.LastSeen) > 10*time.Second {
-					fmt.Printf("⚠️ [DataPlane %s] Worker %s injoignable. Retrait.\n", dpID, id)
+					fmt.Printf("[DataPlane %s] Worker %s injoignable. Retrait.\n", dpID, id)
 					delete(routingTable.workers, id)
 
 					// Nettoyage de la connexion gRPC
 					connPoolMutex.Lock()
-					// Fermeture propre de la connexion pour eviter les fuites de memoire
-					// (Necessite de caster l'interface ou de stocker la connexion initale)
-					// Pour ce prototype, on supprime juste du pool.
-					delete(workerClients, meta.Address)
+					if cc, exists := workerClients[meta.Address]; exists {
+						cc.Conn.Close()
+						delete(workerClients, meta.Address)
+					}
 					connPoolMutex.Unlock()
 				}
 			}
@@ -170,7 +176,7 @@ func main() {
 		// 1. Warm Start prioritaire
 		for _, worker := range routingTable.workers {
 			if _, hasFunc := worker.Functions[funcName]; hasFunc {
-				fmt.Printf("🧠 [Routing] Decision: Warm Start sur %s pour '%s'\n", worker.ID, funcName)
+				fmt.Printf("[Routing] Decision: Warm Start sur %s pour '%s'\n", worker.ID, funcName)
 				return worker.Address
 			}
 		}
@@ -184,7 +190,7 @@ func main() {
 		}
 
 		if bestAddress != "" {
-			fmt.Printf("🧠 [Routing] Decision: Cold Start sur le worker %s\n", bestAddress)
+			fmt.Printf("[Routing] Decision: Cold Start sur le worker %s\n", bestAddress)
 		}
 
 		return bestAddress
@@ -219,7 +225,7 @@ func main() {
 
 		resp, err := workerClient.InvokeFunction(invokeCtx, &pb.InvokeRequest{
 			FunctionName: funcName,
-			Payload:      []byte("{}"), // Dans un vrai projet, on passerait le body HTTP ici
+			Payload:      []byte("{}"), // Payload HTTP a passer ici en production
 		})
 
 		if err != nil {
@@ -255,7 +261,7 @@ func main() {
 		jobBytes, _ := json.Marshal(jobData)
 		nc.Publish("worker.job."+targetAddress, jobBytes)
 
-		fmt.Printf("📦 [Async] Tache '%s' allouee au worker %s. ID: %s\n", funcName, targetAddress, jobID)
+		fmt.Printf("[Async] Tache '%s' allouee au worker %s. ID: %s\n", funcName, targetAddress, jobID)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)

@@ -31,7 +31,7 @@ func (ws *WorkerState) bootSandbox(funcName string) string {
 		return nic
 	}
 
-	fmt.Printf("❄️  [Cold Start] Demarrage Hyperviseur pour '%s'...\n", funcName)
+	fmt.Printf("[Cold Start] Demarrage Hyperviseur pour '%s'...\n", funcName)
 	time.Sleep(200 * time.Millisecond) // Simule creation de MicroVM
 
 	virtualNIC := fmt.Sprintf("10.0.0.%d", len(ws.activeSandboxes)+2)
@@ -61,7 +61,7 @@ func (s *workerServer) InvokeFunction(ctx context.Context, req *pb.InvokeRequest
 	s.state.Unlock()
 
 	nic := s.state.bootSandbox(req.FunctionName)
-	fmt.Printf("🔥 [Sync-gRPC] Transfert de la requete vers NIC %s\n", nic)
+	fmt.Printf("[Sync-gRPC] Transfert de la requete vers NIC %s\n", nic)
 	time.Sleep(50 * time.Millisecond) // Simulation de l'execution dans l'hyperviseur
 
 	s.state.Lock()
@@ -103,20 +103,20 @@ func main() {
 		activeSandboxes: make(map[string]string),
 	}
 
-	fmt.Printf("⚙️ Agent %s en ecoute sur %s (gRPC Data Path)\n", workerID, workerAddress)
+	fmt.Printf("Agent %s en ecoute sur %s (gRPC Data Path)\n", workerID, workerAddress)
 
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 0})
 
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
-		log.Fatalf("❌ NATS injoignable : %v", err)
+		log.Fatalf(" NATS injoignable : %v", err)
 	}
 	defer nc.Close()
 
 	// Enregistrement aupres du Controller (gRPC)
 	conn, err := grpc.Dial("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("❌ Controller injoignable : %v", err)
+		log.Fatalf(" Controller injoignable : %v", err)
 	}
 	defer conn.Close()
 	client := pb.NewControllerServiceClient(conn)
@@ -129,7 +129,7 @@ func main() {
 		Port:      int32(port),
 	})
 	if err != nil {
-		log.Fatalf("❌ Erreur enregistrement Worker: %v", err)
+		log.Fatalf(" Erreur enregistrement Worker: %v", err)
 	}
 
 	// -------------------------------------------------------------
@@ -173,7 +173,7 @@ func main() {
 		ws.Unlock()
 
 		nic := ws.bootSandbox(funcName)
-		fmt.Printf("🔥 [Async] Execution sur NIC %s...\n", nic)
+		fmt.Printf("[Async] Execution sur NIC %s...\n", nic)
 		time.Sleep(500 * time.Millisecond) // Temps de calcul
 
 		rdb.Set(context.Background(), "job:"+jobID, "SUCCESS (Worker: "+workerID+")", 24*time.Hour)
@@ -188,7 +188,7 @@ func main() {
 	// -------------------------------------------------------------
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatalf("❌ Erreur reseau Worker: %v", err)
+		log.Fatalf(" Erreur reseau Worker: %v", err)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -198,6 +198,6 @@ func main() {
 	})
 
 	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("❌ Erreur serveur gRPC Worker: %v", err)
+		log.Fatalf(" Erreur serveur gRPC Worker: %v", err)
 	}
 }
