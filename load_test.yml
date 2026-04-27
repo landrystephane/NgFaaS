@@ -1,0 +1,19 @@
+config:
+  # L'URL cible de notre Data Plane
+  target: "http://localhost:9000"
+  phases:
+    # Phase 1 : Echauffement (Warm up) - 5 utilisateurs par seconde pendant 10 secondes
+    - duration: 10
+      arrivalRate: 5
+      name: "Echauffement"
+    # Phase 2 : Charge soutenue - 20 utilisateurs par seconde pendant 30 secondes
+    - duration: 30
+      arrivalRate: 20
+      name: "Charge soutenue"
+scenarios:
+  - name: "Invocation Synchrone FaaS"
+    flow:
+      - post:
+          url: "/invoke/fonction-artillery"
+          json:
+            payload: "donnees-de-test"

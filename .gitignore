@@ -1,0 +1,11 @@
+# Binaries
+/build/
+controller
+dataplane
+worker
+
+# Go workspace
+*.work
+
+# OS specific
+.DS_Store

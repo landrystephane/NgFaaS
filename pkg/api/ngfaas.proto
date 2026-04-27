@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package api;
+
+// Specifie ou le code Go genere doit etre place
+option go_package = "ngfaas/pkg/api";
+
+// =========================================================
+// SERVICE DU CONTROL PLANE (Le Cerveau)
+// =========================================================
+service ControllerService {
+  // Enregistrement des composants d'infrastructure
+  rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterResponse);
+  rpc RegisterDataPlane (RegisterDataPlaneRequest) returns (RegisterResponse);
+
+  // Enregistrement des fonctions par les clients
+  rpc RegisterFunction (RegisterFunctionRequest) returns (RegisterResponse);
+
+  // Heartbeats (peut aussi se faire via NATS)
+  rpc SendHeartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Messages d'infrastructure
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string ip_address = 2;
+  int32 port = 3; // Port sur lequel le Worker ecoute les invocations gRPC
+}
+
+message RegisterDataPlaneRequest {
+  string dataplane_id = 1;
+  string ip_address = 2;
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RegisterFunctionRequest {
+  string function_name = 1;
+  string image_url = 2;
+  int32 memory_limit_mb = 3;
+}
+
+message HeartbeatRequest {
+  string component_id = 1;
+  string component_type = 2;
+  string status = 3;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+}
+
+// =========================================================
+// SERVICE DU WORKER (Le Data Path Mimir)
+// =========================================================
+// Ce service est expose par chaque Worker. Le Data Plane l'utilise
+// pour envoyer directement les requetes d'execution a la vitesse gRPC.
+service WorkerService {
+  rpc InvokeFunction (InvokeRequest) returns (InvokeResponse);
+}
+
+message InvokeRequest {
+  string function_name = 1;
+  bytes payload = 2; // Les donnees json de la requete utilisateur
+}
+
+message InvokeResponse {
+  bool success = 1;
+  string result = 2; // Le retour de la fonction
+  string execution_nic = 3; // L'IP virtuelle utilisee (pour tracer le Cold/Warm start)
+}
